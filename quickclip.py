@@ -4,6 +4,7 @@ from array import array
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, nullcontext
+import csv
 from dataclasses import dataclass, field
 import json
 import math
@@ -39,6 +40,7 @@ class BatchResult:
     feed_rows: Counter = field(default_factory=Counter)
     feed_mentions: int = 0
     feed_matches: int = 0
+    feed_uncertain_rows: int = 0
 
 
 RECORDING_EXTENSIONS = (".mkv", ".mp4", ".mov", ".ts", ".flv", ".webm")
@@ -150,6 +152,25 @@ FEED = (.42, .30, .58, .0)
 SCORE = (.44, .38, .28, .34)
 DEFAULT_SCORE = r"\+\s*[0-9]{2,5}\b|\b[0-9]{2,5}\s*XP\b"
 NAME_TOKEN = re.compile(r"(?=[\w.-]*[^\W\d_])[\w.-]{3,32}")
+OCR_MODES = ("Grayscale", "Bright text", "Colored HUD")
+OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored"), OCR_MODES))
+OCR_WIDTH, OCR_HEIGHT = 960, 480
+OCR_HEADER = f"P5\n{OCR_WIDTH} {OCR_HEIGHT}\n255\n".encode("ascii")
+OCR_CONFIDENCE = 60
+
+
+@dataclass(frozen=True)
+class OCRRow:
+    words: tuple[tuple[str, float], ...]
+
+    @property
+    def text(self):
+        return " ".join(word for word, _ in self.words)
+
+    @property
+    def readable(self):
+        return any(confidence >= OCR_CONFIDENCE and NAME_TOKEN.fullmatch(word)
+                   for word, confidence in self.words)
 
 
 @dataclass(frozen=True)
@@ -158,6 +179,7 @@ class KillFeedOptions:
     any_mention: bool = False
     fallback_track: int | str = 0
     threshold: float = -18
+    mode: str = OCR_MODES[0]
 
 
 def parse_feed_region(text):
@@ -171,28 +193,68 @@ def parse_feed_region(text):
     return width, height, left, top
 
 
-def ocr_events(path, region, reason, identify, duration, progress, *, page_mode="11", stop=None):
+def ocr_filter(region, mode):
     width, height, left, top = region
-    filters = (f"fps=2:start_time=0,crop=iw*{width}:ih*{height}:iw*{left}:ih*{top}:exact=1,"
-               "scale=768:384,format=gray")
+    filters = (f"crop=iw*{width}:ih*{height}:iw*{left}:ih*{top}:exact=1,"
+               f"scale={OCR_WIDTH}:{OCR_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos,"
+               f"pad={OCR_WIDTH}:{OCR_HEIGHT}:(ow-iw)/2:(oh-ih)/2")
+    if mode == OCR_MODES[2]:
+        # Isolate saturated HUD lettering from relatively neutral scenery.
+        filters += (",format=yuv444p,"
+                    "geq=lum='if(gte(max(abs(cb(X,Y)-128),abs(cr(X,Y)-128)),22),0,255)':"
+                    "cb=128:cr=128:interpolation=nearest")
+    filters += ",format=gray,setsar=1"
+    if mode == OCR_MODES[1]:
+        filters += ",lut=y='if(gte(val,175),0,255)'"
+    return filters
+
+
+def read_ocr_frame(frame, page_mode, environment):
+    text = run(["tesseract", "stdin", "stdout", "-l", "eng", "--psm", page_mode, "tsv"],
+               input=frame, env=environment).decode(errors="replace")
+    lines = {}
+    for row in csv.DictReader(text.splitlines(), delimiter="\t", quoting=csv.QUOTE_NONE):
+        word = row.get("text")
+        if row.get("level") == "5" and word and word.strip():
+            key = (row["page_num"], row["block_num"], row["par_num"], row["line_num"])
+            lines.setdefault(key, []).append((word.strip(), float(row["conf"])))
+    return tuple(OCRRow(tuple(words)) for words in lines.values())
+
+
+def preview_feed(path, seconds, region, mode, any_mention):
+    pixels = run(["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{seconds:.3f}",
+                  "-filter_threads", "1", "-threads:v", "1", "-i", str(path), "-map", "0:V:0",
+                  "-an", "-frames:v", "1", "-vf", ocr_filter(region, mode), "-threads:v", "1",
+                  "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"])
+    if len(pixels) != OCR_WIDTH * OCR_HEIGHT:
+        raise ValueError("No preview frame at that time. Try an earlier frame.")
+    image = OCR_HEADER + pixels
+    return image, read_ocr_frame(image, "11" if any_mention else "6",
+                                 {**os.environ, "OMP_THREAD_LIMIT": "1"})
+
+
+def ocr_events(path, region, reason, identify, duration, progress, *,
+               page_mode="11", stop=None, mode=OCR_MODES[0]):
+    filters = "fps=2:start_time=0," + ocr_filter(region, mode)
     command = decode(path, "-filter_threads", "1", "-threads:v", "1")
     command += ["-map", "0:V:0", "-an", "-vf", filters, "-threads:v", "1",
                 "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
     tesseract_env = {**os.environ, "OMP_THREAD_LIMIT": "1"}
-    header = b"P5\n768 384\n255\n"
     recent = deque(maxlen=3)
-    with closing(blocks(command, 768 * 384)) as frames:
+    last_frame = None
+    with closing(blocks(command, OCR_WIDTH * OCR_HEIGHT)) as frames:
         for index, data in enumerate(frames):
             if stop is not None and stop.is_set():
                 return
-            if len(data) != 768 * 384:
+            if len(data) != OCR_WIDTH * OCR_HEIGHT:
                 raise RuntimeError("FFmpeg returned a partial video frame.")
             timestamp = index / 2
             if index % 20 == 0:
                 progress(f"Scanning {reason.lower()} at {timestamp:.0f} / {duration:.0f}s")
-            text = run(["tesseract", "stdin", "stdout", "-l", "eng", "--psm", page_mode],
-                       input=header + data, env=tesseract_env).decode(errors="replace")
-            matches = identify(text)
+            if data != last_frame:
+                rows = read_ocr_frame(OCR_HEADER + data, page_mode, tesseract_env)
+                last_frame = data
+            matches = identify(rows)
             previous = set().union(*recent)
             if matches - previous:
                 yield timestamp, reason
@@ -258,8 +320,8 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         killer_pattern = re.compile(r"^\s*(?:\[[^\]]+\]\s*)?" + player_pattern.pattern,
                                     re.IGNORECASE)
 
-        def feed_matches(text):
-            lines = {" ".join(line.casefold().split()) for line in text.splitlines() if line.strip()}
+        def feed_matches(rows):
+            lines = {row.text.casefold() for row in rows}
             mentions = {line for line in lines if player_pattern.search(line)}
             if killer_only:
                 matches = {line for line in mentions if (match := killer_pattern.match(line))
@@ -269,7 +331,9 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
             if diagnostics is not None:
                 diagnostics.feed_mentions += bool(mentions)
                 diagnostics.feed_matches += bool(matches)
-                for line in sorted(lines, key=lambda line: line not in mentions):
+                readable = {row.text.casefold() for row in rows if row.readable} | mentions
+                diagnostics.feed_uncertain_rows += len(lines - readable)
+                for line in sorted(readable, key=lambda line: line not in mentions):
                     line = line[:160]
                     if len(diagnostics.feed_rows) < 100 or line in diagnostics.feed_rows:
                         diagnostics.feed_rows[line] += 1
@@ -277,9 +341,10 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
 
         events.extend(ocr_events(path, feed.region if feed else FEED, "Kill feed", feed_matches,
                                  recording.duration, progress, page_mode="6" if killer_only else "11",
-                                 stop=stop))
+                                 stop=stop, mode=feed.mode if feed else OCR_MODES[0]))
     if score_pattern:
-        def score_matches(text):
+        def score_matches(rows):
+            text = "\n".join(row.text for row in rows)
             return {"".join(match.group().upper().split()) for match in score_pattern.finditer(text)}
 
         events.extend(ocr_events(path, SCORE, "Score popup", score_matches,
@@ -567,6 +632,8 @@ def main():
                         help=f"Recordings to scan at once in montage mode (default {DEFAULT_MONTAGE_WORKERS}).")
     parser.add_argument("--feed-region", default="58,0,42,30", metavar="L,T,W,H",
                         help="Montage kill-feed crop as percentages of the full frame.")
+    parser.add_argument("--feed-text-mode", choices=OCR_MODE_ARGS, default="grayscale",
+                        help="Image treatment used on the montage kill-feed crop.")
     parser.add_argument("--any-feed-mention", action="store_true",
                         help="Include any OCR line mentioning the player in a montage, including deaths.")
     parser.add_argument("--montage-audio-fallback", action="store_true",
@@ -595,7 +662,8 @@ def main():
             fallback_track = (args.mic_track if args.mic_track else "auto") if args.montage_audio_fallback else 0
             validate_detection(fallback_track, args.threshold, args.player, "", before, after)
             feed = KillFeedOptions(parse_feed_region(args.feed_region), args.any_feed_mention,
-                                   fallback_track, args.threshold)
+                                   fallback_track, args.threshold,
+                                   OCR_MODE_ARGS[args.feed_text_mode])
             results, montage = kill_montage(sources, args.player, before, after, args.output,
                                             audio_offset_ms=args.audio_offset_ms, workers=args.workers,
                                             feed=feed)
@@ -605,6 +673,8 @@ def main():
                           f"{result.feed_matches} matching current rule.")
                     for line, count in result.feed_rows.most_common(12):
                         print(f"  {count:>4}  {line}")
+                    if result.feed_uncertain_rows:
+                        print(f"  Skipped {result.feed_uncertain_rows} low-confidence or non-name OCR row(s).")
                     if not any(NAME_TOKEN.search(line) for line in result.feed_rows):
                         print("  No name-like text. Check --feed-region on footage with a visible kill feed.")
                 for error in result.errors:

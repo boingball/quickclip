@@ -38,7 +38,7 @@ For a large first batch, try mic-only detection and **Find highlights** on a few
 3. Select a row and click **Play clip** to preview it in FFplay. Click its **Keep** checkbox or press **Space** on the focused row to toggle it. All candidates are checked initially.
 4. Choose the output folder and click **Build montage** to join the checked clips into one MKV in filename order.
 
-Open **OCR readout** to see the possible names and raw rows QuickClip read for each recording. If the readout is empty on footage with a visible feed, use **Set kill-feed area**, load a frame at a known kill, and draw a box around the feed. **Match name anywhere in feed** is a looser check that can also include deaths and assists.
+Open **OCR readout** to see possible names and readable rows from each recording. If those rows look wrong, open **Set kill-feed area**, load a frame at a known kill, and draw a tight box around the complete feed. Choose **Colored HUD** for red, blue, or green lettering, **Bright text** for light lettering, or **Grayscale** for an unfiltered comparison. Click **Test OCR** to see the processed crop and Tesseract's readings for that frame before saving or scanning the folder. The numbers next to the words are Tesseract confidence scores. **Match name anywhere in feed** is a looser check that can also include deaths and assists.
 
 Enable **Use loud audio if no kill matches** for older recordings. This uses the mic threshold and selected track. Auto tries an isolated mic first and uses Track 1 when there is no clear mic. With only a mixed track, loud game audio can also trigger candidates.
 
@@ -83,6 +83,6 @@ The command uses three seconds before and two after each match by default. Overr
 Add `--files 5` to try the first five recordings in filename order. This limits the number of source files scanned. Each recording can still yield multiple highlights.
 Use `--workers 2` to scan two recordings at a time, or `--workers 1` to scan sequentially.
 
-Use `--show-feed` to show OCR rows, `--feed-region 58,0,42,30` to set the crop as left, top, width, and height percentages, and `--any-feed-mention` for looser matching. Add `--montage-audio-fallback` to check loud audio when a recording has no kill matches.
+Use `--show-feed` to show OCR rows, `--feed-region 58,0,42,30` to set the crop as left, top, width, and height percentages, and `--feed-text-mode colored` to isolate saturated lettering. Use `--any-feed-mention` for looser matching and `--montage-audio-fallback` to check loud audio when a recording has no kill matches.
 
 If all audio tracks play late in an exported clip, try `--audio-offset-ms -1000` to bring them one second earlier. The desktop app has the same **Export audio offset (ms)** setting. Positive values delay audio. The offset applies to all tracks during export and defaults to zero.
