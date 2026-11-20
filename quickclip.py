@@ -39,6 +39,7 @@ class BatchResult:
     errors: list[str]
     feed_rows: Counter = field(default_factory=Counter)
     feed_mentions: int = 0
+    feed_green_mentions: int | None = None
     feed_matches: int = 0
     feed_uncertain_rows: int = 0
 
@@ -152,8 +153,9 @@ FEED = (.42, .30, .58, .0)
 SCORE = (.44, .38, .28, .34)
 DEFAULT_SCORE = r"\+\s*[0-9]{2,5}\b|\b[0-9]{2,5}\s*XP\b"
 NAME_TOKEN = re.compile(r"(?=[\w.-]*[^\W\d_])[\w.-]{3,32}")
-OCR_MODES = ("Grayscale", "Bright text", "Colored HUD")
-OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored"), OCR_MODES))
+GREEN_PLAYER = "Green player"
+OCR_MODES = ("Grayscale", "Bright text", "Colored HUD", GREEN_PLAYER)
+OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored", "green"), OCR_MODES))
 OCR_WIDTH, OCR_HEIGHT = 960, 480
 OCR_HEADER = f"P5\n{OCR_WIDTH} {OCR_HEIGHT}\n255\n".encode("ascii")
 OCR_CONFIDENCE = 60
@@ -162,6 +164,7 @@ OCR_CONFIDENCE = 60
 @dataclass(frozen=True)
 class OCRRow:
     words: tuple[tuple[str, float], ...]
+    green_words: frozenset[str] = frozenset()
 
     @property
     def text(self):
@@ -198,27 +201,45 @@ def ocr_filter(region, mode):
     filters = (f"crop=iw*{width}:ih*{height}:iw*{left}:ih*{top}:exact=1,"
                f"scale={OCR_WIDTH}:{OCR_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos,"
                f"pad={OCR_WIDTH}:{OCR_HEIGHT}:(ow-iw)/2:(oh-ih)/2")
-    if mode == OCR_MODES[2]:
+    if mode in (OCR_MODES[2], GREEN_PLAYER):
         # Isolate saturated HUD lettering from relatively neutral scenery.
-        filters += (",format=yuv444p,"
-                    "geq=lum='if(gte(max(abs(cb(X,Y)-128),abs(cr(X,Y)-128)),22),0,255)':"
-                    "cb=128:cr=128:interpolation=nearest")
+        ink = "if(gte(max(abs(cb(X,Y)-128),abs(cr(X,Y)-128)),22),0,255)"
+        if mode == GREEN_PLAYER:
+            # Use chroma differences to keep green black and other HUD colors gray.
+            cb, cr = "(cb(X,Y)-128)", "(cr(X,Y)-128)"
+            green = f"gte(min(-.2*{cb}-2*{cr},-2*{cb}-.5*{cr}),18)"
+            ink = f"if({green},0,if(eq({ink},0),92,255))"
+        filters += f",format=yuv444p,geq=lum='{ink}':cb=128:cr=128:interpolation=nearest"
     filters += ",format=gray,setsar=1"
     if mode == OCR_MODES[1]:
         filters += ",lut=y='if(gte(val,175),0,255)'"
     return filters
 
 
-def read_ocr_frame(frame, page_mode, environment):
+def has_green_ink(frame, row):
+    left, top, width, height = (int(row[field]) for field in ("left", "top", "width", "height"))
+    green = ink = 0
+    for y in range(top, min(top + height, OCR_HEIGHT)):
+        start = len(OCR_HEADER) + y * OCR_WIDTH + left
+        pixels = frame[start:start + min(width, OCR_WIDTH - left)]
+        green += pixels.count(0)
+        ink += len(pixels) - pixels.count(255)
+    return green >= 3 and green >= .25 * ink
+
+
+def read_ocr_frame(frame, page_mode, environment, mode):
     text = run(["tesseract", "stdin", "stdout", "-l", "eng", "--psm", page_mode, "tsv"],
                input=frame, env=environment).decode(errors="replace")
     lines = {}
+    green_words = {}
     for row in csv.DictReader(text.splitlines(), delimiter="\t", quoting=csv.QUOTE_NONE):
         word = row.get("text")
         if row.get("level") == "5" and word and word.strip():
             key = (row["page_num"], row["block_num"], row["par_num"], row["line_num"])
             lines.setdefault(key, []).append((word.strip(), float(row["conf"])))
-    return tuple(OCRRow(tuple(words)) for words in lines.values())
+            if mode == GREEN_PLAYER and has_green_ink(frame, row):
+                green_words.setdefault(key, set()).add(word.strip())
+    return tuple(OCRRow(tuple(words), frozenset(green_words.get(key, ()))) for key, words in lines.items())
 
 
 def preview_feed(path, seconds, region, mode, any_mention):
@@ -230,7 +251,7 @@ def preview_feed(path, seconds, region, mode, any_mention):
         raise ValueError("No preview frame at that time. Try an earlier frame.")
     image = OCR_HEADER + pixels
     return image, read_ocr_frame(image, "11" if any_mention else "6",
-                                 {**os.environ, "OMP_THREAD_LIMIT": "1"})
+                                 {**os.environ, "OMP_THREAD_LIMIT": "1"}, mode)
 
 
 def ocr_events(path, region, reason, identify, duration, progress, *,
@@ -252,7 +273,7 @@ def ocr_events(path, region, reason, identify, duration, progress, *,
             if index % 20 == 0:
                 progress(f"Scanning {reason.lower()} at {timestamp:.0f} / {duration:.0f}s")
             if data != last_frame:
-                rows = read_ocr_frame(OCR_HEADER + data, page_mode, tesseract_env)
+                rows = read_ocr_frame(OCR_HEADER + data, page_mode, tesseract_env, mode)
                 last_frame = data
             matches = identify(rows)
             previous = set().union(*recent)
@@ -323,11 +344,17 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         def feed_matches(rows):
             lines = {row.text.casefold() for row in rows}
             mentions = {line for line in lines if player_pattern.search(line)}
+            candidates = mentions
+            if feed is not None and feed.mode == GREEN_PLAYER:
+                candidates = {row.text.casefold() for row in rows
+                              if any(player_pattern.search(word) for word in row.green_words)}
+                if diagnostics is not None:
+                    diagnostics.feed_green_mentions = (diagnostics.feed_green_mentions or 0) + bool(candidates)
             if killer_only:
-                matches = {line for line in mentions if (match := killer_pattern.match(line))
+                matches = {line for line in candidates if (match := killer_pattern.match(line))
                            and re.search(r"\w", line[match.end():])}
             else:
-                matches = mentions
+                matches = candidates
             if diagnostics is not None:
                 diagnostics.feed_mentions += bool(mentions)
                 diagnostics.feed_matches += bool(matches)
@@ -671,6 +698,8 @@ def main():
                 if args.show_feed:
                     print(f"{result.source.name}: player seen in {result.feed_mentions} sample(s), "
                           f"{result.feed_matches} matching current rule.")
+                    if result.feed_green_mentions is not None:
+                        print(f"  Player name marked green in {result.feed_green_mentions} sample(s).")
                     for line, count in result.feed_rows.most_common(12):
                         print(f"  {count:>4}  {line}")
                     if result.feed_uncertain_rows:

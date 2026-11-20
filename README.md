@@ -40,6 +40,8 @@ For a large first batch, try mic-only detection and **Find highlights** on a few
 
 Open **OCR readout** to see possible names and readable rows from each recording. If those rows look wrong, open **Set kill-feed area**, load a frame at a known kill, and draw a tight box around the complete feed. Choose **Colored HUD** for red, blue, or green lettering, **Bright text** for light lettering, or **Grayscale** for an unfiltered comparison. Click **Test OCR** to see the processed crop and Tesseract's readings for that frame before saving or scanning the folder. The numbers next to the words are Tesseract confidence scores. **Match name anywhere in feed** is a looser check that can also include deaths and assists.
 
+If your name is always green, try **Green player**. QuickClip requires the matching name to be green and keeps the other colored names visible for the killer-side check. **Test OCR** marks the words it classified as green. The command-line equivalent is `--feed-text-mode green`.
+
 Enable **Use loud audio if no kill matches** for older recordings. This uses the mic threshold and selected track. Auto tries an isolated mic first and uses Track 1 when there is no clear mic. With only a mixed track, loud game audio can also trigger candidates.
 
 Use recordings with compatible video and audio formats. The montage preserves all audio tracks and uses your export audio offset. When mixing a single-track recording with a compatible multitrack recording, QuickClip treats the single track as the main track and fills the missing tracks with silence. Other incompatible layouts need separate montages.

@@ -559,7 +559,9 @@ class Desktop:
         detail.pack(fill="both", expand=True, pady=(8, 0))
         if rows:
             for row in rows:
-                words = " ".join(f"{word} [{confidence:.0f}]" for word, confidence in row.words)
+                words = " ".join(
+                    f"{word} [{confidence:.0f}{', green' if word in row.green_words else ''}]"
+                    for word, confidence in row.words)
                 detail.insert("end", words + "\n")
             if not any(row.readable for row in rows):
                 detail.insert("end", "\nNo confident name-like text on this frame.")
@@ -574,6 +576,8 @@ class Desktop:
             lines.append(result.source.name)
             lines.append(f"Player seen in {result.feed_mentions} sample(s), "
                          f"{result.feed_matches} matching the selected rule.")
+            if result.feed_green_mentions is not None:
+                lines.append(f"Player name marked green in {result.feed_green_mentions} sample(s).")
             names = Counter()
             for row, count in result.feed_rows.items():
                 for name in set(NAME_TOKEN.findall(row)):
