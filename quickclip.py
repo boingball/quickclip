@@ -22,6 +22,7 @@ from threading import Event
 class Recording:
     duration: float
     audio: tuple[str, ...]
+    frame_size: tuple[int, int] = (1920, 1080)
 
 
 @dataclass(frozen=True)
@@ -39,6 +40,8 @@ class BatchResult:
     errors: list[str]
     feed_rows: Counter = field(default_factory=Counter)
     feed_mentions: int = 0
+    feed_left_mentions: int = 0
+    feed_right_mentions: int = 0
     feed_green_mentions: int | None = None
     feed_matches: int = 0
     feed_uncertain_rows: int = 0
@@ -60,15 +63,19 @@ def run(command, **kwargs):
 def probe(path):
     info = json.loads(run(["ffprobe", "-v", "error", "-show_format",
                            "-show_streams", "-of", "json", str(path)]))
-    if not any(s["codec_type"] == "video" and not s.get("disposition", {}).get("attached_pic")
-               for s in info["streams"]):
+    video = next((s for s in info["streams"] if s["codec_type"] == "video"
+                  and not s.get("disposition", {}).get("attached_pic")), None)
+    if video is None:
         raise ValueError("Select a recording with a video stream.")
     audio = tuple(s.get("tags", {}).get("title", s["codec_name"])
                   for s in info["streams"] if s["codec_type"] == "audio")
     duration = float(info["format"].get("duration", 0))
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("The recording needs a readable duration.")
-    return Recording(duration, audio)
+    frame_size = (video["width"], video["height"])
+    if any(abs(side.get("rotation", 0)) % 180 == 90 for side in video.get("side_data_list", [])):
+        frame_size = frame_size[::-1]
+    return Recording(duration, audio, frame_size)
 
 
 def blocks(command, size):
@@ -165,6 +172,7 @@ OCR_CONFIDENCE = 60
 class OCRRow:
     words: tuple[tuple[str, float], ...]
     green_words: frozenset[str] = frozenset()
+    centres: tuple[float, ...] = ()
 
     @property
     def text(self):
@@ -175,6 +183,19 @@ class OCRRow:
         return any(confidence >= OCR_CONFIDENCE and NAME_TOKEN.fullmatch(word)
                    for word, confidence in self.words)
 
+    def name_positions(self, pattern):
+        spans = []
+        start = 0
+        for (word, _), centre in zip(self.words, self.centres):
+            end = start + len(word)
+            spans.append((start, end, centre, word in self.green_words))
+            start = end + 1
+        for match in pattern.finditer(self.text):
+            hits = [(centre, green) for start, end, centre, green in spans
+                    if start < match.end() and end > match.start()]
+            if hits:
+                yield sum(centre for centre, _ in hits) / len(hits), all(green for _, green in hits)
+
 
 @dataclass(frozen=True)
 class KillFeedOptions:
@@ -183,6 +204,7 @@ class KillFeedOptions:
     fallback_track: int | str = 0
     threshold: float = -18
     mode: str = OCR_MODES[0]
+    divider: float = .5
 
 
 def parse_feed_region(text):
@@ -194,6 +216,24 @@ def parse_feed_region(text):
             and left + width <= 1.0000001 and top + height <= 1.0000001):
         raise ValueError("Keep the crop within the frame and at least 1% wide and tall.")
     return width, height, left, top
+
+
+def parse_feed_divider(text):
+    try:
+        divider = float(text) / 100
+        if 0 < divider < 1:
+            return divider
+    except ValueError:
+        pass
+    raise ValueError("Enter a kill/death divider between 0 and 100%.")
+
+
+def feed_divider_x(frame_size, region, divider):
+    width, height = frame_size
+    crop_width = max(1, int(width * region[0]))
+    crop_height = max(1, int(height * region[1]))
+    scaled_width = min(OCR_WIDTH, OCR_HEIGHT * crop_width / crop_height)
+    return (OCR_WIDTH - scaled_width) / 2 + divider * scaled_width
 
 
 def ocr_filter(region, mode):
@@ -232,17 +272,20 @@ def read_ocr_frame(frame, page_mode, environment, mode):
                input=frame, env=environment).decode(errors="replace")
     lines = {}
     green_words = {}
+    centres = {}
     for row in csv.DictReader(text.splitlines(), delimiter="\t", quoting=csv.QUOTE_NONE):
         word = row.get("text")
         if row.get("level") == "5" and word and word.strip():
             key = (row["page_num"], row["block_num"], row["par_num"], row["line_num"])
             lines.setdefault(key, []).append((word.strip(), float(row["conf"])))
+            centres.setdefault(key, []).append(int(row["left"]) + int(row["width"]) / 2)
             if mode == GREEN_PLAYER and has_green_ink(frame, row):
                 green_words.setdefault(key, set()).add(word.strip())
-    return tuple(OCRRow(tuple(words), frozenset(green_words.get(key, ()))) for key, words in lines.items())
+    return tuple(OCRRow(tuple(words), frozenset(green_words.get(key, ())), tuple(centres[key]))
+                 for key, words in lines.items())
 
 
-def preview_feed(path, seconds, region, mode, any_mention):
+def preview_feed(path, seconds, region, mode, any_mention, divider=.5):
     pixels = run(["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{seconds:.3f}",
                   "-filter_threads", "1", "-threads:v", "1", "-i", str(path), "-map", "0:V:0",
                   "-an", "-frames:v", "1", "-vf", ocr_filter(region, mode), "-threads:v", "1",
@@ -250,8 +293,9 @@ def preview_feed(path, seconds, region, mode, any_mention):
     if len(pixels) != OCR_WIDTH * OCR_HEIGHT:
         raise ValueError("No preview frame at that time. Try an earlier frame.")
     image = OCR_HEADER + pixels
-    return image, read_ocr_frame(image, "11" if any_mention else "6",
-                                 {**os.environ, "OMP_THREAD_LIMIT": "1"}, mode)
+    rows = read_ocr_frame(image, "11" if any_mention else "6",
+                          {**os.environ, "OMP_THREAD_LIMIT": "1"}, mode)
+    return image, rows, feed_divider_x(probe(path).frame_size, region, divider)
 
 
 def ocr_events(path, region, reason, identify, duration, progress, *,
@@ -337,26 +381,32 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         events.extend(microphone_events(levels, threshold, recording.duration, reason, progress))
     if player:
         killer_only = feed is not None and not feed.any_mention
+        green_only = feed is not None and feed.mode == GREEN_PLAYER
         player_pattern = re.compile(r"(?<!\w)" + re.escape(player) + r"(?!\w)", re.IGNORECASE)
-        killer_pattern = re.compile(r"^\s*(?:\[[^\]]+\]\s*)?" + player_pattern.pattern,
-                                    re.IGNORECASE)
+        divider = feed_divider_x(recording.frame_size, feed.region, feed.divider) if feed else None
 
         def feed_matches(rows):
             lines = {row.text.casefold() for row in rows}
             mentions = {line for line in lines if player_pattern.search(line)}
-            candidates = mentions
-            if feed is not None and feed.mode == GREEN_PLAYER:
-                candidates = {row.text.casefold() for row in rows
-                              if any(player_pattern.search(word) for word in row.green_words)}
-                if diagnostics is not None:
-                    diagnostics.feed_green_mentions = (diagnostics.feed_green_mentions or 0) + bool(candidates)
-            if killer_only:
-                matches = {line for line in candidates if (match := killer_pattern.match(line))
-                           and re.search(r"\w", line[match.end():])}
+            left = right = green_name = False
+            matches = set()
+            if feed:
+                for row in rows:
+                    for centre, green in row.name_positions(player_pattern):
+                        is_left = centre < divider
+                        left |= is_left
+                        right |= not is_left
+                        green_name |= green
+                        if (is_left or not killer_only) and (green or not green_only):
+                            matches.add(row.text.casefold())
             else:
-                matches = candidates
+                matches = mentions
             if diagnostics is not None:
                 diagnostics.feed_mentions += bool(mentions)
+                diagnostics.feed_left_mentions += left
+                diagnostics.feed_right_mentions += right
+                if green_only:
+                    diagnostics.feed_green_mentions = (diagnostics.feed_green_mentions or 0) + green_name
                 diagnostics.feed_matches += bool(matches)
                 readable = {row.text.casefold() for row in rows if row.readable} | mentions
                 diagnostics.feed_uncertain_rows += len(lines - readable)
@@ -659,6 +709,8 @@ def main():
                         help=f"Recordings to scan at once in montage mode (default {DEFAULT_MONTAGE_WORKERS}).")
     parser.add_argument("--feed-region", default="58,0,42,30", metavar="L,T,W,H",
                         help="Montage kill-feed crop as percentages of the full frame.")
+    parser.add_argument("--feed-divider", default="50", metavar="PERCENT",
+                        help="Position of the kill/death split measured from the left edge of the crop.")
     parser.add_argument("--feed-text-mode", choices=OCR_MODE_ARGS, default="grayscale",
                         help="Image treatment used on the montage kill-feed crop.")
     parser.add_argument("--any-feed-mention", action="store_true",
@@ -690,7 +742,7 @@ def main():
             validate_detection(fallback_track, args.threshold, args.player, "", before, after)
             feed = KillFeedOptions(parse_feed_region(args.feed_region), args.any_feed_mention,
                                    fallback_track, args.threshold,
-                                   OCR_MODE_ARGS[args.feed_text_mode])
+                                   OCR_MODE_ARGS[args.feed_text_mode], parse_feed_divider(args.feed_divider))
             results, montage = kill_montage(sources, args.player, before, after, args.output,
                                             audio_offset_ms=args.audio_offset_ms, workers=args.workers,
                                             feed=feed)
@@ -698,6 +750,8 @@ def main():
                 if args.show_feed:
                     print(f"{result.source.name}: player seen in {result.feed_mentions} sample(s), "
                           f"{result.feed_matches} matching current rule.")
+                    print(f"  Left side: {result.feed_left_mentions} sample(s); "
+                          f"right side: {result.feed_right_mentions} sample(s).")
                     if result.feed_green_mentions is not None:
                         print(f"  Player name marked green in {result.feed_green_mentions} sample(s).")
                     for line, count in result.feed_rows.most_common(12):

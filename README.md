@@ -34,11 +34,13 @@ For a large first batch, try mic-only detection and **Find highlights** on a few
 ## Make a kill montage
 
 1. Open a recording or folder, enter your in-game name, and set the seconds before and after each kill. Set **Montage file limit** to `5` for a short trial, or leave it blank to scan the whole folder.
-2. Click **Find montage clips**. QuickClip runs Tesseract only on the top-right crop and looks for kill-feed rows starting with your name. It merges overlapping moments from the same recording. Up to four recordings scan concurrently by default, and results appear as each file finishes. Adjust **Montage scan workers** to change how many run at once.
+2. Click **Find montage clips**. QuickClip runs Tesseract only on the kill-feed crop. It counts your name on the left of the kill/death divider even if no other text is readable. It merges overlapping moments from the same recording. Up to four recordings scan concurrently by default, and results appear as each file finishes. Adjust **Montage scan workers** to change how many run at once.
 3. Select a row and click **Play clip** to preview it in FFplay. Click its **Keep** checkbox or press **Space** on the focused row to toggle it. All candidates are checked initially.
 4. Choose the output folder and click **Build montage** to join the checked clips into one MKV in filename order.
 
 Open **OCR readout** to see possible names and readable rows from each recording. If those rows look wrong, open **Set kill-feed area**, load a frame at a known kill, and draw a tight box around the complete feed. Choose **Colored HUD** for red, blue, or green lettering, **Bright text** for light lettering, or **Grayscale** for an unfiltered comparison. Click **Test OCR** to see the processed crop and Tesseract's readings for that frame before saving or scanning the folder. The numbers next to the words are Tesseract confidence scores. **Match name anywhere in feed** is a looser check that can also include deaths and assists.
+
+In **Set kill-feed area**, place the blue **Kill/death divider** between the killer and victim names. The default is halfway across the crop. **Test OCR** labels each word left or right, and **OCR readout** counts how often your name was seen on each side.
 
 If your name is always green, try **Green player**. QuickClip requires the matching name to be green and keeps the other colored names visible for the killer-side check. **Test OCR** marks the words it classified as green. The command-line equivalent is `--feed-text-mode green`.
 
@@ -85,6 +87,6 @@ The command uses three seconds before and two after each match by default. Overr
 Add `--files 5` to try the first five recordings in filename order. This limits the number of source files scanned. Each recording can still yield multiple highlights.
 Use `--workers 2` to scan two recordings at a time, or `--workers 1` to scan sequentially.
 
-Use `--show-feed` to show OCR rows, `--feed-region 58,0,42,30` to set the crop as left, top, width, and height percentages, and `--feed-text-mode colored` to isolate saturated lettering. Use `--any-feed-mention` for looser matching and `--montage-audio-fallback` to check loud audio when a recording has no kill matches.
+Use `--show-feed` to show OCR rows, `--feed-region 58,0,42,30` to set the crop as left, top, width, and height percentages, and `--feed-divider 50` to put the kill/death split halfway across the crop. Use `--feed-text-mode colored` to isolate saturated lettering, `--any-feed-mention` for looser matching, and `--montage-audio-fallback` to check loud audio when a recording has no kill matches.
 
 If all audio tracks play late in an exported clip, try `--audio-offset-ms -1000` to bring them one second earlier. The desktop app has the same **Export audio offset (ms)** setting. Positive values delay audio. The offset applies to all tracks during export and defaults to zero.
