@@ -294,7 +294,8 @@ class Desktop:
                 prepare_output(self.sources, directory)
             for index, (source, clip) in enumerate(clips, 1):
                 self.messages.put(("progress", f"Exporting clip {index} of {len(clips)}…"))
-                export_clip(source, clip, directory)
+                export_clip(source, clip, directory,
+                            progress=lambda msg: self.messages.put(("progress", msg)))
             return len(clips)
 
         self.work(operation, lambda count: self.status.set(f"Exported {count} clip(s) to {directory}"))

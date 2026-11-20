@@ -234,16 +234,28 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
     return find_clips(events, recording.duration, before, after)
 
 
-def export_clip(source, clip, directory):
+def export_clip(source, clip, directory, progress=print):
     directory.mkdir(parents=True, exist_ok=True)
     stem = f"{source.stem}_{round(clip.start * 1000):09d}_{round(clip.end * 1000):09d}"
     with tempfile.TemporaryDirectory(prefix=".quickclip-", dir=directory) as temp:
         encoded = Path(temp) / "clip.mkv"
-        run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-             "-ss", f"{clip.start:.3f}", "-i", str(source),
-             "-t", f"{clip.end - clip.start:.3f}", "-map", "0:V:0", "-map", "0:a?",
-             "-map_chapters", "-1", "-c:v", "libx264", "-preset", "fast",
-             "-crf", "18", "-c:a", "flac", str(encoded)])
+        command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                   "-filter_threads", "1", "-ss", f"{clip.start:.3f}"]
+        streams = ["-i", str(source), "-t", f"{clip.end - clip.start:.3f}",
+                   "-map", "0:V:0", "-map", "0:a?", "-map_chapters", "-1",
+                   "-c:v", "libx264", "-crf", "18", "-c:a", "flac"]
+        try:
+            run(command + ["-threads:v", "2"] + streams
+                + ["-threads:v", "2", "-preset", "fast", "-x264-params",
+                   "rc-lookahead=12:lookahead-threads=1", str(encoded)])
+        except RuntimeError as error:
+            if not re.search(r"malloc of size .* failed|cannot allocate memory|out of memory",
+                             str(error), re.IGNORECASE):
+                raise
+            encoded.unlink(missing_ok=True)
+            progress("Encoder ran out of memory. Retrying with a lower-memory preset.")
+            run(command + ["-threads:v", "1"] + streams
+                + ["-threads:v", "1", "-preset", "ultrafast", str(encoded)])
         for suffix in range(10000):
             destination = directory / (stem + (f"_{suffix}" if suffix else "") + ".mkv")
             try:
@@ -301,7 +313,7 @@ def process_batch(sources, options, output=None, progress=print):
             for count, clip in enumerate(result.clips, 1):
                 report(f"Exporting clip {count}/{len(result.clips)}")
                 try:
-                    result.exports.append(export_clip(source, clip, output))
+                    result.exports.append(export_clip(source, clip, output, progress=report))
                 except (OSError, RuntimeError) as error:
                     result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
         yield result
