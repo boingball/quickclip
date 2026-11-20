@@ -2,15 +2,19 @@
 import argparse
 from array import array
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import closing
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from threading import Event
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,7 @@ class BatchResult:
 
 
 RECORDING_EXTENSIONS = (".mkv", ".mp4", ".mov", ".ts", ".flv", ".webm")
+DEFAULT_MONTAGE_WORKERS = min(4, os.cpu_count() or 1)
 BACKGROUND = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
 
 
@@ -76,9 +81,9 @@ def blocks(command, size):
                     process.kill()
 
 
-def decode(path):
+def decode(path, *input_options):
     return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-            "-copyts", "-start_at_zero", "-i", str(path)]
+            "-copyts", "-start_at_zero", *input_options, "-i", str(path)]
 
 
 def audio_levels(path, track):
@@ -141,27 +146,32 @@ SCORE = (.44, .38, .28, .34)
 DEFAULT_SCORE = r"\+\s*[0-9]{2,5}\b|\b[0-9]{2,5}\s*XP\b"
 
 
-def ocr_events(path, region, reason, identify, duration, progress, *, page_mode="11"):
+def ocr_events(path, region, reason, identify, duration, progress, *, page_mode="11", stop=None):
     width, height, left, top = region
     filters = (f"fps=2:start_time=0,crop=iw*{width}:ih*{height}:iw*{left}:ih*{top},"
                "scale=768:384,format=gray")
-    command = decode(path) + ["-map", "0:V:0", "-an", "-vf", filters,
-                              "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+    command = decode(path, "-filter_threads", "1", "-threads:v", "1")
+    command += ["-map", "0:V:0", "-an", "-vf", filters, "-threads:v", "1",
+                "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
+    tesseract_env = {**os.environ, "OMP_THREAD_LIMIT": "1"}
     header = b"P5\n768 384\n255\n"
     recent = deque(maxlen=3)
-    for index, data in enumerate(blocks(command, 768 * 384)):
-        if len(data) != 768 * 384:
-            raise RuntimeError("FFmpeg returned a partial video frame.")
-        timestamp = index / 2
-        if index % 20 == 0:
-            progress(f"Scanning {reason.lower()} at {timestamp:.0f} / {duration:.0f}s")
-        text = run(["tesseract", "stdin", "stdout", "-l", "eng", "--psm", page_mode],
-                   input=header + data).decode(errors="replace")
-        matches = identify(text)
-        previous = set().union(*recent)
-        if matches - previous:
-            yield timestamp, reason
-        recent.append(matches)
+    with closing(blocks(command, 768 * 384)) as frames:
+        for index, data in enumerate(frames):
+            if stop is not None and stop.is_set():
+                return
+            if len(data) != 768 * 384:
+                raise RuntimeError("FFmpeg returned a partial video frame.")
+            timestamp = index / 2
+            if index % 20 == 0:
+                progress(f"Scanning {reason.lower()} at {timestamp:.0f} / {duration:.0f}s")
+            text = run(["tesseract", "stdin", "stdout", "-l", "eng", "--psm", page_mode],
+                       input=header + data, env=tesseract_env).decode(errors="replace")
+            matches = identify(text)
+            previous = set().union(*recent)
+            if matches - previous:
+                yield timestamp, reason
+            recent.append(matches)
 
 
 def find_clips(events, duration, before, after):
@@ -197,7 +207,7 @@ def validate_detection(track, threshold, player, score, before, after):
 
 
 def scan(path, recording, track, threshold, player, score, before, after, progress=print,
-         *, killer_only=False):
+         *, killer_only=False, stop=None):
     player, score_pattern = validate_detection(track, threshold, player, score, before, after)
     levels = None
     auto = track == "auto"
@@ -230,7 +240,8 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                     if player_pattern.search(line)}
 
         events.extend(ocr_events(path, FEED, "Kill feed", feed_matches,
-                                 recording.duration, progress, page_mode="6" if killer_only else "11"))
+                                 recording.duration, progress, page_mode="6" if killer_only else "11",
+                                 stop=stop))
     if score_pattern:
         def score_matches(text):
             return {"".join(match.group().upper().split()) for match in score_pattern.finditer(text)}
@@ -306,15 +317,30 @@ def prepare_output(sources, output):
     output.mkdir(parents=True, exist_ok=True)
 
 
-def process_batch(sources, options, output=None, progress=print, *, audio_offset_ms=0,
-                  killer_only=False):
+def validate_batch(options):
     validate_detection(*options)
     for program in ("ffmpeg", "ffprobe"):
         if not shutil.which(program):
             raise RuntimeError(f"Install {program} and add it to PATH.")
+
+
+def scan_recording(source, options, progress, *, killer_only=False, stop=None):
+    result = BatchResult(source, [], [], [])
+    if stop is not None and stop.is_set():
+        return result
+    progress("Reading recording")
+    try:
+        result.clips = scan(source, probe(source), *options, progress=progress,
+                            killer_only=killer_only, stop=stop)
+    except (OSError, RuntimeError, ValueError) as error:
+        result.errors.append(str(error))
+    return result
+
+
+def process_batch(sources, options, output=None, progress=print, *, audio_offset_ms=0):
+    validate_batch(options)
     if output is not None:
         prepare_output(sources, output)
-
     total = len(sources)
     for index, source in enumerate(sources, 1):
         prefix = f"[{index}/{total}] {source.name}"
@@ -322,13 +348,7 @@ def process_batch(sources, options, output=None, progress=print, *, audio_offset
         def report(message):
             progress(f"{prefix} · {message}")
 
-        report("Reading recording")
-        result = BatchResult(source, [], [], [])
-        try:
-            result.clips = scan(source, probe(source), *options, progress=report,
-                                killer_only=killer_only)
-        except (OSError, RuntimeError, ValueError) as error:
-            result.errors.append(str(error))
+        result = scan_recording(source, options, report)
         if output is not None:
             export_candidates(result, output, report, audio_offset_ms)
         yield result
@@ -352,15 +372,40 @@ def montage_layout(path):
     return info["streams"]
 
 
-def scan_kills(sources, player, before, after, progress=print):
+def scan_kills(sources, player, before, after, progress=print, *,
+               workers=DEFAULT_MONTAGE_WORKERS, stop=None):
     if not player.strip():
         raise ValueError("Enter your player name to make a kill montage.")
-    return process_batch(sources, (0, -18, player, "", before, after), progress=progress,
-                         killer_only=True)
+    if workers < 1:
+        raise ValueError("Choose at least one montage scan worker.")
+    options = (0, -18, player, "", before, after)
+    validate_batch(options)
+    if not sources:
+        return
+    if stop is None:
+        stop = Event()
+
+    def scan_file(index, source):
+        def report(message):
+            progress(f"[{index}/{len(sources)}] {source.name} · {message}")
+
+        return scan_recording(source, options, report, killer_only=True, stop=stop)
+
+    pool = ThreadPoolExecutor(max_workers=min(workers, len(sources)))
+    try:
+        pending = [pool.submit(scan_file, index, source) for index, source in enumerate(sources, 1)]
+        for future in as_completed(pending):
+            if stop.is_set():
+                break
+            yield future.result()
+    finally:
+        stop.set()
+        pool.shutdown(cancel_futures=True)
 
 
 def write_montage(sources, candidates, output, progress=print, *, audio_offset_ms=0):
     prepare_output(sources, output)
+    source_order = {source: index for index, source in enumerate(sources)}
     with tempfile.TemporaryDirectory(prefix=".quickclip-montage-", dir=output) as temp:
         staging = Path(temp)
         results = []
@@ -371,7 +416,7 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
             if result.clips:
                 progress(f"{result.source.name} · Preparing montage clips")
                 export_candidates(result, staging, progress, audio_offset_ms)
-            for segment in result.exports:
+            for clip_index, segment in enumerate(result.exports):
                 current = montage_layout(segment)
                 if layout is not None and current != layout:
                     raise ValueError(f"{result.source.name} has a different video or audio track layout. "
@@ -379,21 +424,22 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
                 layout = current
                 name = f"segment-{len(segments):06d}.mkv"
                 segment.replace(staging / name)
-                segments.append(f"file '{name}'\n")
+                segments.append((source_order[result.source], clip_index, f"file '{name}'\n"))
         if not segments:
             return results, None
         progress(f"Joining {len(segments)} highlight segment(s)…")
         manifest = staging / "segments.txt"
-        manifest.write_text("".join(segments), encoding="ascii")
+        manifest.write_text("".join(line for _, _, line in sorted(segments)), encoding="ascii")
         encoded = staging / "montage.mkv"
         run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
              "-f", "concat", "-i", str(manifest), "-map", "0", "-c", "copy", str(encoded)])
         return results, publish_export(encoded, output, "kill-montage")
 
 
-def kill_montage(sources, player, before, after, output, progress=print, *, audio_offset_ms=0):
-    return write_montage(sources, scan_kills(sources, player, before, after, progress),
-                         output, progress, audio_offset_ms=audio_offset_ms)
+def kill_montage(sources, player, before, after, output, progress=print, *,
+                 audio_offset_ms=0, workers=DEFAULT_MONTAGE_WORKERS):
+    with closing(scan_kills(sources, player, before, after, progress, workers=workers)) as candidates:
+        return write_montage(sources, candidates, output, progress, audio_offset_ms=audio_offset_ms)
 
 
 def parse_mic_track(value):
@@ -421,6 +467,8 @@ def main():
                         help="Process only the first N recordings in a folder, sorted by filename.")
     parser.add_argument("--kill-montage", action="store_true",
                         help="Join kill-feed matches into one MKV. Requires --player and --output.")
+    parser.add_argument("--workers", type=int, default=DEFAULT_MONTAGE_WORKERS,
+                        help=f"Recordings to scan at once in montage mode (default {DEFAULT_MONTAGE_WORKERS}).")
     parser.add_argument("--audio-offset-ms", type=int, default=0,
                         help="Shift all exported audio tracks. Negative brings audio earlier; positive delays it.")
     args = parser.parse_args()
@@ -441,7 +489,7 @@ def main():
             if args.output is None:
                 raise ValueError("--kill-montage requires an output folder.")
             results, montage = kill_montage(sources, args.player, before, after, args.output,
-                                            audio_offset_ms=args.audio_offset_ms)
+                                            audio_offset_ms=args.audio_offset_ms, workers=args.workers)
             for result in results:
                 for error in result.errors:
                     print(f"{result.source.name}: {error}", file=sys.stderr)

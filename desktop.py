@@ -1,16 +1,19 @@
 """Tk desktop interface for QuickClip."""
 from itertools import groupby
+import json
+import os
 from pathlib import Path
 from queue import Empty, Queue
 import shutil
 import subprocess
-from threading import Thread
+from tempfile import NamedTemporaryFile
+from threading import Event, Thread
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from quickclip import (
-    BatchResult, DEFAULT_SCORE, RECORDING_EXTENSIONS, export_clip, folder_recordings,
-    prepare_output, probe, process_batch, scan_kills, write_montage,
+    BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, RECORDING_EXTENSIONS,
+    export_clip, folder_recordings, prepare_output, probe, process_batch, scan_kills, write_montage,
 )
 
 
@@ -20,14 +23,27 @@ def clock(seconds):
     return f"{hours:02}:{minutes:02}:{remainder:05.2f}"
 
 
+def settings_path():
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        return base / "QuickClip" / "settings.json"
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "quickclip" / "settings.json"
+
+
 class Desktop:
     def __init__(self, root):
         self.root = root
         self.sources = []
+        self.input_path = None
         self.default_output = None
         self.output = None
         self.clips = []
         self.montage_review = False
+        self.montage_scanning = False
+        self.scan_stop = None
+        self.completed_files = 0
+        self.scan_total = 0
         self.kept = set()
         self.messages = Queue()
         self.status = tk.StringVar(value="Open an OBS recording or folder to get started.")
@@ -67,6 +83,8 @@ class Desktop:
         self.audio_offset = ttk.Entry(settings, width=8)
         self.audio_offset.insert(0, "0")
         self.montage_limit = ttk.Entry(settings, width=8)
+        self.montage_workers = ttk.Entry(settings, width=8)
+        self.montage_workers.insert(0, str(DEFAULT_MONTAGE_WORKERS))
         for field, value in ((self.threshold, "-18"), (self.before, "10"), (self.after, "6")):
             field.insert(0, value)
         settings_fields = (
@@ -78,6 +96,7 @@ class Desktop:
             ("Seconds after", self.after, 2, 2),
             ("Export audio offset (ms)", self.audio_offset, 4, 0),
             ("Montage file limit (optional)", self.montage_limit, 5, 0),
+            ("Montage scan workers", self.montage_workers, 6, 0),
         )
         for label, field, row, column in settings_fields:
             ttk.Label(settings, text=label).grid(row=row, column=column, sticky="w", padx=(0, 8))
@@ -123,18 +142,85 @@ class Desktop:
         ttk.Label(body, textvariable=self.status, wraplength=680).pack(fill="x", pady=(10, 0))
 
         self.busy = False
+        self.settings_file = settings_path()
+        self.settings_warning_shown = False
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        self.load_settings()
         self.buttons()
-        root.after(100, self.poll)
+        self.poll_task = root.after(100, self.poll)
+
+    def settings_fields(self):
+        return {
+            "threshold": self.threshold,
+            "before": self.before,
+            "after": self.after,
+            "audio_offset": self.audio_offset,
+            "montage_limit": self.montage_limit,
+            "montage_workers": self.montage_workers,
+        }
+
+    def load_settings(self):
+        try:
+            values = json.loads(self.settings_file.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if not isinstance(values, dict):
+            return
+        for key, field in self.settings_fields().items():
+            if isinstance(values.get(key), str):
+                field.delete(0, "end")
+                field.insert(0, values[key])
+        for key, field in (("player", self.player), ("score", self.score)):
+            if isinstance(values.get(key), str):
+                field.set(values[key])
+        self.score_enabled.set(values.get("score_enabled") is True)
+        if isinstance(values.get("output"), str) and values["output"]:
+            self.output = Path(values["output"])
+            self.show_output()
+        if isinstance(values.get("input"), str) and values["input"]:
+            self.restore_input(Path(values["input"]), values.get("track"))
+
+    def save_settings(self):
+        values = {key: field.get() for key, field in self.settings_fields().items()}
+        values.update(input=str(self.input_path) if self.input_path else "",
+                      output=str(self.output) if self.output else "",
+                      track=self.track.get(), player=self.player.get(), score=self.score.get(),
+                      score_enabled=self.score_enabled.get())
+        temp = None
+        try:
+            self.settings_file.parent.mkdir(parents=True, exist_ok=True)
+            with NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.settings_file.parent,
+                                    prefix=".settings-", delete=False) as stream:
+                temp = Path(stream.name)
+                json.dump(values, stream, ensure_ascii=False)
+            temp.replace(self.settings_file)
+        except OSError as error:
+            if temp is not None:
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            if not self.settings_warning_shown:
+                self.settings_warning_shown = True
+                messagebox.showwarning("QuickClip", f"Could not save settings. {error}")
+
+    def close(self):
+        if self.scan_stop is not None:
+            self.scan_stop.set()
+        self.root.after_cancel(self.poll_task)
+        self.save_settings()
+        self.root.destroy()
 
     def buttons(self):
         ready = bool(self.table.selection()) and not self.busy
+        can_preview = bool(self.table.selection()) and (not self.busy or self.montage_scanning)
         for button in (self.open_button, self.folder_button, self.output_button):
             button.configure(state="disabled" if self.busy else "normal")
         for button in (self.scan_button, self.batch_button, self.montage_button):
             button.configure(state="normal" if self.sources and not self.busy else "disabled")
         self.export_button.configure(state="normal" if ready else "disabled")
         self.build_button.configure(state="normal" if self.kept and not self.busy else "disabled")
-        self.preview_button.configure(state="normal" if ready and shutil.which("ffplay") else "disabled")
+        self.preview_button.configure(state="normal" if can_preview and shutil.which("ffplay") else "disabled")
 
     def work(self, operation, complete):
         self.busy = True
@@ -155,7 +241,17 @@ class Desktop:
                 if kind == "progress":
                     self.status.set(value)
                     continue
+                if kind == "montage_result":
+                    self.completed_files += 1
+                    self.append_candidates(value)
+                    self.update_keep_count()
+                    self.buttons()
+                    continue
                 self.busy = False
+                if self.montage_scanning:
+                    self.montage_scanning = False
+                    self.scan_stop = None
+                    self.update_keep_count()
                 if kind == "error":
                     self.status.set("Operation failed.")
                     messagebox.showerror("QuickClip", value)
@@ -165,7 +261,7 @@ class Desktop:
                 self.buttons()
         except Empty:
             pass
-        self.root.after(100, self.poll)
+        self.poll_task = self.root.after(100, self.poll)
 
     def clear(self, montage=False):
         self.clips = []
@@ -204,7 +300,7 @@ class Desktop:
             return "break"
 
     def toggle_keep(self, row):
-        if self.busy:
+        if self.busy and not self.montage_scanning:
             return
         index = int(row)
         if index in self.kept:
@@ -216,23 +312,37 @@ class Desktop:
         self.buttons()
 
     def update_keep_count(self):
-        self.keep_count.set(f"{len(self.kept)} of {len(self.clips)} clips kept")
+        count = f"{len(self.kept)} of {len(self.clips)} clips kept"
+        if self.montage_scanning:
+            count = f"{self.completed_files}/{self.scan_total} files scanned · {count}"
+        self.keep_count.set(count)
 
     def open(self):
         filters = " ".join(f"*{ext}" for ext in RECORDING_EXTENSIONS)
         filename = filedialog.askopenfilename(filetypes=[("Recordings", filters), ("All files", "*")])
         if filename:
-            source = Path(filename)
-            self.status.set("Reading recording metadata…")
-            self.work(lambda: probe(source),
-                      lambda info: self.set_input([source], source.name, info, source))
+            self.load_recording(Path(filename))
+
+    def restore_input(self, path, track):
+        if self.busy or self.sources:
+            return
+        if path.is_dir():
+            self.load_folder(path, track)
+        elif path.is_file():
+            self.load_recording(path, track)
+
+    def load_recording(self, source, track=None):
+        self.status.set("Reading recording metadata…")
+        self.work(lambda: probe(source),
+                  lambda info: self.set_input([source], source.name, info, source, track=track))
 
     def open_folder(self):
         directory = filedialog.askdirectory()
         if not directory:
             return
-        folder = Path(directory)
+        self.load_folder(Path(directory))
 
+    def load_folder(self, folder, track=None):
         def inspect():
             sources = folder_recordings(folder)
             for source in sources:
@@ -245,20 +355,23 @@ class Desktop:
 
         def complete(result):
             sources, recording, sample = result
-            self.set_input(sources, f"{folder.name} · {len(sources)} recordings", recording, sample, folder)
+            self.set_input(sources, f"{folder.name} · {len(sources)} recordings",
+                           recording, sample, folder, track=track)
 
         self.status.set("Finding recordings…")
         self.work(inspect, complete)
 
-    def set_input(self, sources, label, recording, sample, folder=None):
+    def set_input(self, sources, label, recording, sample, folder=None, *, track=None):
         self.clear()
         self.sources = sources
+        self.input_path = folder or sample
         self.filename.set(label)
         self.default_output = folder / "Highlights" if folder else None
         self.show_output()
-        self.track.configure(values=["Auto", "Off"] + [
-            f"{index}: {title}" for index, title in enumerate(recording.audio, 1)])
-        self.track.current(0)
+        tracks = ["Auto", "Off"] + [f"{index}: {title}" for index, title in enumerate(recording.audio, 1)]
+        self.track.configure(values=tracks)
+        self.track.current(tracks.index(track) if track in tracks else 0)
+        self.save_settings()
         if folder:
             self.status.set(f"Audio tracks shown from {sample.name}. "
                             "Auto checks each recording. For a manual choice, use the same track position across files.")
@@ -275,6 +388,7 @@ class Desktop:
         if directory:
             self.output = Path(directory)
             self.show_output()
+            self.save_settings()
             return self.output
         return None
 
@@ -292,6 +406,10 @@ class Desktop:
                     if not limit.isascii() or not limit.isdecimal() or int(limit) < 1:
                         raise ValueError("Enter a positive whole number for the montage file limit.")
                     sources = sources[:int(limit)]
+                workers = self.montage_workers.get().strip()
+                if not workers.isascii() or not workers.isdecimal() or int(workers) < 1:
+                    raise ValueError("Enter a positive whole number for the montage scan workers.")
+                workers = int(workers)
             else:
                 selection = self.track.current()
                 track = "auto" if selection == 0 else selection - 1
@@ -308,30 +426,30 @@ class Desktop:
             output = self.output or self.default_output or self.choose_output()
             if output is None:
                 return
+        self.save_settings()
+
+        if montage:
+            self.clear(montage=True)
+            self.montage_scanning = True
+            self.scan_stop = Event()
+            self.completed_files = 0
+            self.scan_total = len(sources)
+            self.update_keep_count()
 
         def complete(results):
-            self.clear(montage=montage)
-            exported = 0
-            failures = []
-            for result in results:
-                exported += len(result.exports)
-                if result.errors:
-                    failures.append((result.source, result.errors))
-                for clip in result.clips:
-                    index = len(self.clips)
-                    self.clips.append((result.source, clip))
-                    self.table.insert("", "end", iid=str(index), values=(
-                        "☑" if montage else "", result.source.name, clock(clip.start), clock(clip.end),
-                        ", ".join(clip.reasons)))
+            if not montage:
+                self.clear()
+                for result in results:
+                    self.append_candidates(result)
+            failures = [(result.source, result.errors) for result in results if result.errors]
             status = f"Checked {len(results)} recording(s). Found {len(self.clips)} candidate(s)."
             if montage:
-                self.kept.update(range(len(self.clips)))
-                self.update_keep_count()
                 if self.clips:
-                    self.table.selection_set("0")
-                    self.table.focus("0")
                     status += " Play clips and untick any you want to leave out."
+                elif not failures:
+                    status += " Try a recording where your name is visible in the kill feed."
             elif output is not None:
+                exported = sum(len(result.exports) for result in results)
                 status += f" Exported {exported} to {output}."
             if failures:
                 status += f" {len(failures)} recording(s) had errors."
@@ -344,11 +462,30 @@ class Desktop:
 
         def operation():
             if montage:
-                return list(scan_kills(sources, player, before, after, progress))
+                results = []
+                for result in scan_kills(sources, player, before, after, progress,
+                                         workers=workers, stop=self.scan_stop):
+                    results.append(result)
+                    self.messages.put(("montage_result", result))
+                return results
             return list(process_batch(sources, options, output, progress, audio_offset_ms=audio_offset))
 
         self.status.set("Scanning recordings…")
         self.work(operation, complete)
+
+    def append_candidates(self, result):
+        first = len(self.clips)
+        for clip in result.clips:
+            index = len(self.clips)
+            self.clips.append((result.source, clip))
+            if self.montage_review:
+                self.kept.add(index)
+            self.table.insert("", "end", iid=str(index), values=(
+                "☑" if self.montage_review else "", result.source.name, clock(clip.start),
+                clock(clip.end), ", ".join(clip.reasons)))
+        if self.montage_review and first == 0 and self.clips:
+            self.table.selection_set("0")
+            self.table.focus("0")
 
     def build_montage(self):
         try:
@@ -359,6 +496,7 @@ class Desktop:
         directory = self.output or self.default_output or self.choose_output()
         if directory is None:
             return
+        self.save_settings()
         clips = [self.clips[index] for index in sorted(self.kept)]
         candidates = [BatchResult(source, [clip for _, clip in group], [], [])
                       for source, group in groupby(clips, key=lambda item: item[0])]
@@ -394,7 +532,7 @@ class Desktop:
     def preview(self):
         selected = self.table.selection()
         player = shutil.which("ffplay")
-        if self.busy or not selected or not player:
+        if (self.busy and not self.montage_scanning) or not selected or not player:
             return
         source, clip = self.clips[int(selected[0])]
         try:
@@ -420,6 +558,7 @@ class Desktop:
         directory = self.output or self.default_output or self.choose_output()
         if directory is None:
             return
+        self.save_settings()
 
         def operation():
             if self.default_output is not None:

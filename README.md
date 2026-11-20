@@ -34,11 +34,13 @@ For a large first batch, try mic-only detection and **Find highlights** on a few
 ## Make a kill montage
 
 1. Open a recording or folder, enter your in-game name, and set the seconds before and after each kill. Set **Montage file limit** to `5` for a short trial, or leave it blank to scan the whole folder.
-2. Click **Find montage clips**. QuickClip runs Tesseract only on the top-right crop and looks for kill-feed rows starting with your name. It merges overlapping moments from the same recording.
+2. Click **Find montage clips**. QuickClip runs Tesseract only on the top-right crop and looks for kill-feed rows starting with your name. It merges overlapping moments from the same recording. Up to four recordings scan concurrently by default, and results appear as each file finishes. Adjust **Montage scan workers** to change how many run at once.
 3. Select a row and click **Play clip** to preview it in FFplay. Click its **Keep** checkbox or press **Space** on the focused row to toggle it. All candidates are checked initially.
 4. Choose the output folder and click **Build montage** to join the checked clips into one MKV in filename order.
 
 Use recordings with matching video settings and OBS audio track layouts. The montage preserves every track and uses your export audio offset. OCR can miss small or blurry names, and the row match assumes the killer is shown first.
+
+QuickClip remembers your last input, output folder, and settings. On Windows it stores them in `%APPDATA%\QuickClip\settings.json`.
 
 ## PowerShell and terminal use
 
@@ -75,5 +77,6 @@ py quickclip.py "F:\Raw-Stream" --player boingball --kill-montage --output "F:\Q
 The command uses three seconds before and two after each match by default. Override them with `--before` and `--after`. Use `--audio-offset-ms 1000` if the recordings need that sync adjustment.
 
 Add `--files 5` to try the first five recordings in filename order. This limits the number of source files scanned. Each recording can still yield multiple highlights.
+Use `--workers 2` to scan two recordings at a time, or `--workers 1` to scan sequentially.
 
 If all audio tracks play late in an exported clip, try `--audio-offset-ms -1000` to bring them one second earlier. The desktop app has the same **Export audio offset (ms)** setting. Positive values delay audio. The offset applies to all tracks during export and defaults to zero.
