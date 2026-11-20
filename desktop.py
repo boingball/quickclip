@@ -55,7 +55,7 @@ class Desktop:
         settings.pack(fill="x", pady=12)
         settings.columnconfigure(1, weight=1)
         settings.columnconfigure(3, weight=1)
-        self.track = ttk.Combobox(settings, state="readonly", values=("Off",))
+        self.track = ttk.Combobox(settings, state="readonly", values=("Auto", "Off"))
         self.track.current(0)
         self.threshold = ttk.Entry(settings, width=8)
         self.before = ttk.Entry(settings, width=8)
@@ -189,15 +189,15 @@ class Desktop:
         self.filename.set(label)
         self.default_output = folder / "Highlights" if folder else None
         self.show_output()
-        self.track.configure(values=["Off"] + [
+        self.track.configure(values=["Auto", "Off"] + [
             f"{index}: {title}" for index, title in enumerate(recording.audio, 1)])
         self.track.current(0)
         if folder:
             self.status.set(f"Audio tracks shown from {sample.name}. "
-                            "Choose a mic track that is in the same position across your recordings.")
+                            "Auto checks each recording. For a manual choice, use the same track position across files.")
         else:
             self.status.set(f"{clock(recording.duration)} · {len(recording.audio)} audio track(s). "
-                            "Choose the isolated mic track or enable on-screen detection.")
+                            "Auto looks for the isolated mic track. You can also pick it manually.")
 
     def show_output(self):
         directory = self.output or self.default_output
@@ -213,7 +213,9 @@ class Desktop:
 
     def start_scan(self, auto_export=False):
         try:
-            options = (self.track.current(), float(self.threshold.get()), self.player.get(),
+            selection = self.track.current()
+            track = "auto" if selection == 0 else selection - 1
+            options = (track, float(self.threshold.get()), self.player.get(),
                        self.score.get().strip() if self.score_enabled.get() else "",
                        float(self.before.get()), float(self.after.get()))
             if self.score_enabled.get() and not options[3]:

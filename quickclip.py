@@ -81,20 +81,58 @@ def decode(path):
             "-copyts", "-start_at_zero", "-i", str(path)]
 
 
-def microphone_events(path, track, threshold, duration, progress):
+def audio_levels(path, track):
     # Measure RMS in 100 ms windows, after aligning audio to the recording clock.
     command = decode(path) + ["-map", f"0:a:{track - 1}", "-vn", "-ac", "1",
                               "-af", "aresample=8000:first_pts=0",
                               "-f", "s16le", "pipe:1"]
-    cutoff = 32768 * 10 ** (threshold / 20)
-    for index, data in enumerate(blocks(command, 1600)):
-        if index % 300 == 0:
-            progress(f"Scanning microphone at {index / 10:.0f} / {duration:.0f}s")
+    for data in blocks(command, 1600):
         samples = array("h", data)
         if sys.byteorder != "little":
             samples.byteswap()
-        if samples and sum(value * value for value in samples) >= len(samples) * cutoff ** 2:
-            yield index / 10, "Mic peak"
+        yield sum(value * value for value in samples) / (len(samples) * 32768 ** 2)
+
+
+def detect_mic_track(path, recording, progress):
+    tracks = list(enumerate(recording.audio, 1))
+    named = [index for index, title in tracks
+             if re.fullmatch(r"(?:my |local |obs )?(?:mic|microphone)(?: input)?",
+                             title.strip(), re.IGNORECASE)]
+    if len(named) == 1:
+        progress(f"Auto-selected mic track {named[0]} ({recording.audio[named[0] - 1]}) by name.")
+        return named[0], None
+
+    candidates = []
+    for index, title in tracks:
+        progress(f"Checking audio track {index}/{len(tracks)} ({title})")
+        levels = list(audio_levels(path, index))
+        if not levels:
+            continue
+        upper = sorted(levels)[int(.995 * (len(levels) - 1))]
+        # Allow a low, steady mic noise floor if bursts are much louder.
+        quiet_limit = max(10 ** (-48 / 10), min(10 ** (-34 / 10), upper / 100))
+        quiet = sum(level <= quiet_limit for level in levels) / len(levels)
+        active = sum(level >= quiet_limit * 10 ** (8 / 10) for level in levels)
+        progress(f"Track {index}: {quiet:.0%} quiet, {active / len(levels):.0%} active.")
+        if quiet >= .35 and active >= max(3, .005 * len(levels)):
+            candidates.append((index, levels))
+    if len(candidates) == 1:
+        index, levels = candidates[0]
+        progress(f"Auto-selected mic track {index} ({recording.audio[index - 1]}).")
+        return index, levels
+    detail = ("Several tracks have quiet gaps and bursts: "
+              + ", ".join(str(index) for index, _ in candidates)
+              if candidates else "No track had enough quiet gaps and audible bursts")
+    raise ValueError(f"{detail}. Play the audio tracks to identify yours, then select it manually.")
+
+
+def microphone_events(levels, threshold, duration, reason, progress):
+    cutoff = 10 ** (threshold / 10)
+    for index, level in enumerate(levels):
+        if index % 300 == 0:
+            progress(f"Scanning microphone at {index / 10:.0f} / {duration:.0f}s")
+        if level >= cutoff:
+            yield index / 10, reason
 
 
 # Fractions of the full video, in width, height, left, top order.
@@ -143,7 +181,7 @@ def find_clips(events, duration, before, after):
 
 
 def validate_detection(track, threshold, player, score, before, after):
-    if track < 0:
+    if track != "auto" and track < 0:
         raise ValueError("Choose a positive audio track number, or use 0 to disable.")
     if not math.isfinite(threshold) or not -90 <= threshold <= 0:
         raise ValueError("Mic threshold must be between -90 and 0 dBFS.")
@@ -160,11 +198,24 @@ def validate_detection(track, threshold, player, score, before, after):
 
 def scan(path, recording, track, threshold, player, score, before, after, progress=print):
     player, score_pattern = validate_detection(track, threshold, player, score, before, after)
+    levels = None
+    auto = track == "auto"
+    if auto:
+        try:
+            track, levels = detect_mic_track(path, recording, progress)
+        except ValueError as error:
+            if not (player or score_pattern):
+                raise
+            progress(f"Mic detection skipped: {error}")
+            track = 0
     if track > len(recording.audio):
         raise ValueError(f"Audio track {track} is missing. Recording has {len(recording.audio)} audio track(s).")
     events = []
     if track:
-        events.extend(microphone_events(path, track, threshold, recording.duration, progress))
+        if levels is None:
+            levels = audio_levels(path, track)
+        reason = f"Mic peak (track {track})" if auto else "Mic peak"
+        events.extend(microphone_events(levels, threshold, recording.duration, reason, progress))
     if player:
         player_pattern = re.compile(r"(?<!\w)" + re.escape(player) + r"(?!\w)", re.IGNORECASE)
 
@@ -256,10 +307,20 @@ def process_batch(sources, options, output=None, progress=print):
         yield result
 
 
+def parse_mic_track(value):
+    if value.lower() == "auto":
+        return "auto"
+    try:
+        return int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("use auto, 0 (off), or a 1-based track number") from error
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("recording", type=Path, nargs="?", help="Recording or folder. Omit to open the desktop app.")
-    parser.add_argument("--mic-track", type=int, default=0, help="1-based audio track; 0 disables mic detection.")
+    parser.add_argument("--mic-track", type=parse_mic_track,
+                        help="auto, 0 (off), or a 1-based track number. Defaults to auto without OCR.")
     parser.add_argument("--threshold", type=float, default=-18, help="Mic RMS threshold in dBFS.")
     parser.add_argument("--player", default="", help="Enable kill-feed OCR for this name.")
     parser.add_argument("--score", action="store_true", help="Enable score popup OCR.")
@@ -274,7 +335,10 @@ def main():
         return
     try:
         score = args.score_pattern or (DEFAULT_SCORE if args.score else "")
-        options = (args.mic_track, args.threshold, args.player, score, args.before, args.after)
+        track = args.mic_track
+        if track is None:
+            track = 0 if args.player.strip() or score else "auto"
+        options = (track, args.threshold, args.player, score, args.before, args.after)
         if args.recording.is_dir():
             sources = folder_recordings(args.recording)
             failed = 0
@@ -298,9 +362,6 @@ def main():
         info = probe(args.recording)
         for index, track in enumerate(info.audio, 1):
             print(f"Audio track {index}: {track}")
-        if not (args.mic_track or args.player or args.score or args.score_pattern):
-            print("Enable a detector with --mic-track, --player, or --score.")
-            return
         clips = scan(args.recording, info, *options)
         for clip in clips:
             print(f"{clip.start:.2f}–{clip.end:.2f}s  {', '.join(clip.reasons)}")

@@ -13,7 +13,7 @@ On Linux, use `python3 quickclip.py` with the same tools on PATH and your distri
 
 ## Find highlights
 
-1. Open an OBS recording. Choose the isolated **Microphone track** from the list. Track numbers are the saved audio streams in file order. If OBS recorded only tracks 1 and 4, for example, the app lists them as 1 and 2.
+1. Open an OBS recording and leave **Microphone track** on **Auto**, or choose the isolated mic track manually. Track numbers are the saved audio streams in file order. If OBS recorded only tracks 1 and 4, for example, the app lists them as 1 and 2.
 2. Start with a **Mic threshold** of **−18 dBFS**. Raise it toward zero if ordinary speech triggers clips. Lower it if OBS compression or gain makes your reactions quieter.
 3. To enable OCR, enter your exact in-game name, turn on **Detect score popups**, or both. The feed scan uses the upper-right of the image and the score scan uses the centre. The default score pattern looks for text such as `+150` or `150 XP`. You can enter a custom regular expression for the text your HUD shows.
 4. Set how many seconds to keep before and after each cue, then choose **Find highlights**. Overlapping windows merge into one candidate and show all the cues that contributed.
@@ -21,9 +21,11 @@ On Linux, use `python3 quickclip.py` with the same tools on PATH and your distri
 
 Keep your mic on its own recording track in OBS so loud gameplay and voice chat do not drive the mic detector. Kill-feed OCR flags any newly visible line containing your name, including deaths or assists. Score scanning can pick up other matching HUD text, and small or blurred text can be missed. Start with a short recording to check how the defaults fit your footage. Mic-only scanning is faster for long sessions.
 
+Auto looks for a track named **Mic** or **Microphone** first. With generic names such as `Track1`, it checks each track for quiet gaps and audible bursts. If your friend's track has a similar pattern, use your media player's audio-track menu to identify yours and select that number manually. Auto checks each recording independently.
+
 ## Process a folder
 
-1. Click **Open folder** and select your recordings folder. QuickClip scans supported video files directly inside it. The microphone track list comes from the first readable recording, so use the same mic track position throughout the batch.
+1. Click **Open folder** and select your recordings folder. QuickClip scans supported video files directly inside it. If you choose a mic track manually, use the same mic track position throughout the batch. The track list comes from the first readable recording.
 2. Click **Output folder** to choose where clips go, or use the default `Highlights` subfolder. The app creates it when exporting.
 3. Click **Scan and export all** to process the batch automatically, or **Find highlights** to review candidates first. The app shows the current file and keeps going if a recording fails. The results list identifies each candidate's source, and any errors appear at the end.
 
@@ -31,11 +33,13 @@ For a large first batch, try mic-only detection and **Find highlights** on a few
 
 ## PowerShell and terminal use
 
-List the audio streams:
+List the audio streams, automatically identify the mic, and show highlight candidates:
 
 ```powershell
 py quickclip.py "D:\OBS\match.mkv"
 ```
+
+Use `--mic-track 2` to override the choice. When enabling OCR on the command line, add `--mic-track auto` to enable both detectors.
 
 Scan and list candidates:
 
