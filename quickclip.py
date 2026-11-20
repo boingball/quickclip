@@ -164,8 +164,9 @@ DEFAULT_SCORE = r"\+\s*[0-9]{2,5}\b|\b[0-9]{2,5}\s*XP\b"
 NAME_TOKEN = re.compile(r"(?=[\w.-]*[^\W\d_])[\w.-]{3,32}")
 OCR_LOOKALIKES = ("o0", "il1", "s5", "b8", "z2")
 GREEN_PLAYER = "Green player"
-OCR_MODES = ("Grayscale", "Bright text", "Colored HUD", GREEN_PLAYER)
-OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored", "green"), OCR_MODES))
+FAINT_TEXT = "Faint text"
+OCR_MODES = ("Grayscale", "Bright text", "Colored HUD", GREEN_PLAYER, FAINT_TEXT)
+OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored", "green", "faint"), OCR_MODES))
 OCR_WIDTH, OCR_HEIGHT = 960, 480
 OCR_HEADER = f"P5\n{OCR_WIDTH} {OCR_HEIGHT}\n255\n".encode("ascii")
 OCR_CONFIDENCE = 60
@@ -313,8 +314,16 @@ def player_name_pattern(player, allow_lookalikes=False):
 def ocr_filter(region, mode):
     width, height, left, top = region
     filters = (f"crop=iw*{width}:ih*{height}:iw*{left}:ih*{top}:exact=1,"
-               f"scale={OCR_WIDTH}:{OCR_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos,"
-               f"pad={OCR_WIDTH}:{OCR_HEIGHT}:(ow-iw)/2:(oh-ih)/2")
+               f"scale={OCR_WIDTH}:{OCR_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos")
+    pad = f"pad={OCR_WIDTH}:{OCR_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
+    if mode == FAINT_TEXT:
+        # Compare luminance and chroma with the local background before padding.
+        # Absolute differences preserve pale and dark strokes in the same row.
+        return (filters + ",format=yuv444p,split=2[detail][base];[base]gblur=sigma=9[background];"
+                "[detail][background]blend=all_mode=difference,"
+                "geq=lum='clip(255-22*max(max(max(lum(X,Y),cb(X,Y)),cr(X,Y))-1,0),0,255)':"
+                "cb=128:cr=128:interpolation=nearest,format=gray," + pad + ":color=white,setsar=1")
+    filters += "," + pad
     if mode in (OCR_MODES[2], GREEN_PLAYER):
         # Isolate saturated HUD lettering from relatively neutral scenery.
         ink = "if(gte(max(abs(cb(X,Y)-128),abs(cr(X,Y)-128)),22),0,255)"

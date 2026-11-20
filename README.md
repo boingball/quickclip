@@ -46,6 +46,8 @@ The **Recording** list in **Set kill-feed area** lets you pick any file in the o
 
 If your name is always green, try **Green player**. QuickClip requires the matching name to be green and keeps the other colored names visible for the killer-side check. For names of at least six letters or digits, it also accepts one common OCR substitution, such as `l` for `i` or `o` for `0`. **OCR readout** lists those spellings separately for review. **Test OCR** marks the words it classified as green. The command-line equivalent is `--feed-text-mode green`.
 
+For washed-out lettering, try **Faint text** in **Test OCR** first. It boosts small differences in brightness and color around the letters. It works on light and dark names in the same row without requiring a green hue. Save the area to apply the treatment to your montage scan. The command-line equivalent is `--feed-text-mode faint`.
+
 Enable **Use loud audio if no kill matches** for older recordings. This uses the mic threshold and selected track. Auto tries an isolated mic first and uses Track 1 when there is no clear mic. With only a mixed track, loud game audio can also trigger candidates.
 
 Use recordings with compatible video and audio formats. The montage preserves all audio tracks and uses your export audio offset. When mixing a single-track recording with a compatible multitrack recording, QuickClip treats the single track as the main track and fills the missing tracks with silence. Other incompatible layouts need separate montages.
