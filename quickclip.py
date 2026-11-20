@@ -42,6 +42,7 @@ class BatchResult:
     feed_mentions: int = 0
     feed_left_mentions: int = 0
     feed_right_mentions: int = 0
+    feed_unknown_mentions: int = 0
     feed_green_mentions: int | None = None
     feed_matches: int = 0
     feed_uncertain_rows: int = 0
@@ -169,32 +170,59 @@ OCR_CONFIDENCE = 60
 
 
 @dataclass(frozen=True)
+class OCRWord:
+    text: str
+    confidence: float
+    left: int
+    top: int
+    width: int
+    height: int
+    green: bool
+
+    @property
+    def right(self):
+        return self.left + self.width
+
+    @property
+    def centre(self):
+        return self.left + self.width / 2
+
+    @property
+    def middle(self):
+        return self.top + self.height / 2
+
+
+@dataclass(frozen=True)
 class OCRRow:
-    words: tuple[tuple[str, float], ...]
-    green_words: frozenset[str] = frozenset()
-    centres: tuple[float, ...] = ()
+    words: tuple[OCRWord, ...]
+    divider: float | None = None
 
     @property
     def text(self):
-        return " ".join(word for word, _ in self.words)
+        return " ".join(word.text for word in self.words)
 
     @property
     def readable(self):
-        return any(confidence >= OCR_CONFIDENCE and NAME_TOKEN.fullmatch(word)
-                   for word, confidence in self.words)
+        return any(word.confidence >= OCR_CONFIDENCE and NAME_TOKEN.fullmatch(word.text)
+                   for word in self.words)
 
-    def name_positions(self, pattern):
+    def side(self, word):
+        if self.divider is not None:
+            return "left" if word.centre < self.divider else "right"
+        return "unknown"
+
+    def name_sides(self, pattern):
         spans = []
         start = 0
-        for (word, _), centre in zip(self.words, self.centres):
-            end = start + len(word)
-            spans.append((start, end, centre, word in self.green_words))
+        for word in self.words:
+            end = start + len(word.text)
+            spans.append((start, end, word))
             start = end + 1
         for match in pattern.finditer(self.text):
-            hits = [(centre, green) for start, end, centre, green in spans
-                    if start < match.end() and end > match.start()]
+            hits = [word for start, end, word in spans if start < match.end() and end > match.start()]
             if hits:
-                yield sum(centre for centre, _ in hits) / len(hits), all(green for _, green in hits)
+                sides = {self.side(word) for word in hits}
+                yield sides.pop() if len(sides) == 1 else "unknown", all(word.green for word in hits)
 
 
 @dataclass(frozen=True)
@@ -204,7 +232,7 @@ class KillFeedOptions:
     fallback_track: int | str = 0
     threshold: float = -18
     mode: str = OCR_MODES[0]
-    divider: float = .5
+    divider: float | None = None
 
 
 def parse_feed_region(text):
@@ -234,6 +262,37 @@ def feed_divider_x(frame_size, region, divider):
     crop_height = max(1, int(height * region[1]))
     scaled_width = min(OCR_WIDTH, OCR_HEIGHT * crop_width / crop_height)
     return (OCR_WIDTH - scaled_width) / 2 + divider * scaled_width
+
+
+def find_row_gap(words):
+    names = [word for word in words if NAME_TOKEN.fullmatch(word.text) and word.confidence >= 20]
+    gaps = [(right.left - left.right, (left.right + right.left) / 2)
+            for left, right in zip(names, names[1:])
+            if right.left - left.right >= max(5, .4 * min(left.height, right.height))]
+    return max(gaps)[1] if gaps else None
+
+
+def position_feed_rows(rows, fixed_divider):
+    if fixed_divider is not None:
+        return tuple(OCRRow(row.words, fixed_divider) for row in rows)
+
+    # Tesseract may put the killer and victim in different text blocks.
+    groups = []
+    for word in sorted((word for row in rows for word in row.words), key=lambda word: -word.height):
+        same_row = [row for row in groups
+                    if abs(row[0].middle - word.middle) <= .5 * row[0].height
+                    and min(row[0].top + row[0].height, word.top + word.height)
+                    - max(row[0].top, word.top) >= .5 * word.height]
+        if same_row:
+            min(same_row, key=lambda row: abs(row[0].middle - word.middle)).append(word)
+        else:
+            groups.append([word])
+
+    positioned = []
+    for group in sorted(groups, key=lambda group: group[0].middle):
+        words = tuple(sorted(group, key=lambda word: word.left))
+        positioned.append(OCRRow(words, find_row_gap(words)))
+    return tuple(positioned)
 
 
 def ocr_filter(region, mode):
@@ -271,21 +330,18 @@ def read_ocr_frame(frame, page_mode, environment, mode):
     text = run(["tesseract", "stdin", "stdout", "-l", "eng", "--psm", page_mode, "tsv"],
                input=frame, env=environment).decode(errors="replace")
     lines = {}
-    green_words = {}
-    centres = {}
     for row in csv.DictReader(text.splitlines(), delimiter="\t", quoting=csv.QUOTE_NONE):
         word = row.get("text")
         if row.get("level") == "5" and word and word.strip():
             key = (row["page_num"], row["block_num"], row["par_num"], row["line_num"])
-            lines.setdefault(key, []).append((word.strip(), float(row["conf"])))
-            centres.setdefault(key, []).append(int(row["left"]) + int(row["width"]) / 2)
-            if mode == GREEN_PLAYER and has_green_ink(frame, row):
-                green_words.setdefault(key, set()).add(word.strip())
-    return tuple(OCRRow(tuple(words), frozenset(green_words.get(key, ())), tuple(centres[key]))
-                 for key, words in lines.items())
+            left, top, width, height = (int(row[field]) for field in ("left", "top", "width", "height"))
+            green = mode == GREEN_PLAYER and has_green_ink(frame, row)
+            lines.setdefault(key, []).append(OCRWord(word.strip(), float(row["conf"]),
+                                                     left, top, width, height, green))
+    return tuple(OCRRow(tuple(words)) for words in lines.values())
 
 
-def preview_feed(path, seconds, region, mode, any_mention, divider=.5):
+def preview_feed(path, seconds, region, mode, divider=None):
     pixels = run(["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{seconds:.3f}",
                   "-filter_threads", "1", "-threads:v", "1", "-i", str(path), "-map", "0:V:0",
                   "-an", "-frames:v", "1", "-vf", ocr_filter(region, mode), "-threads:v", "1",
@@ -293,9 +349,9 @@ def preview_feed(path, seconds, region, mode, any_mention, divider=.5):
     if len(pixels) != OCR_WIDTH * OCR_HEIGHT:
         raise ValueError("No preview frame at that time. Try an earlier frame.")
     image = OCR_HEADER + pixels
-    rows = read_ocr_frame(image, "11" if any_mention else "6",
-                          {**os.environ, "OMP_THREAD_LIMIT": "1"}, mode)
-    return image, rows, feed_divider_x(probe(path).frame_size, region, divider)
+    rows = read_ocr_frame(image, "6", {**os.environ, "OMP_THREAD_LIMIT": "1"}, mode)
+    split = feed_divider_x(probe(path).frame_size, region, divider) if divider is not None else None
+    return image, position_feed_rows(rows, split), split
 
 
 def ocr_events(path, region, reason, identify, duration, progress, *,
@@ -383,28 +439,31 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         killer_only = feed is not None and not feed.any_mention
         green_only = feed is not None and feed.mode == GREEN_PLAYER
         player_pattern = re.compile(r"(?<!\w)" + re.escape(player) + r"(?!\w)", re.IGNORECASE)
-        divider = feed_divider_x(recording.frame_size, feed.region, feed.divider) if feed else None
+        divider = (feed_divider_x(recording.frame_size, feed.region, feed.divider)
+                   if feed and feed.divider is not None else None)
 
         def feed_matches(rows):
+            if feed:
+                rows = position_feed_rows(rows, divider)
             lines = {row.text.casefold() for row in rows}
             mentions = {line for line in lines if player_pattern.search(line)}
-            left = right = green_name = False
+            sides = set()
+            green_name = False
             matches = set()
             if feed:
                 for row in rows:
-                    for centre, green in row.name_positions(player_pattern):
-                        is_left = centre < divider
-                        left |= is_left
-                        right |= not is_left
+                    for side, green in row.name_sides(player_pattern):
+                        sides.add(side)
                         green_name |= green
-                        if (is_left or not killer_only) and (green or not green_only):
+                        if (side == "left" or not killer_only) and (green or not green_only):
                             matches.add(row.text.casefold())
             else:
                 matches = mentions
             if diagnostics is not None:
                 diagnostics.feed_mentions += bool(mentions)
-                diagnostics.feed_left_mentions += left
-                diagnostics.feed_right_mentions += right
+                diagnostics.feed_left_mentions += "left" in sides
+                diagnostics.feed_right_mentions += "right" in sides
+                diagnostics.feed_unknown_mentions += "unknown" in sides
                 if green_only:
                     diagnostics.feed_green_mentions = (diagnostics.feed_green_mentions or 0) + green_name
                 diagnostics.feed_matches += bool(matches)
@@ -417,7 +476,7 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
             return matches
 
         events.extend(ocr_events(path, feed.region if feed else FEED, "Kill feed", feed_matches,
-                                 recording.duration, progress, page_mode="6" if killer_only else "11",
+                                 recording.duration, progress, page_mode="6" if feed else "11",
                                  stop=stop, mode=feed.mode if feed else OCR_MODES[0]))
     if score_pattern:
         def score_matches(rows):
@@ -709,8 +768,8 @@ def main():
                         help=f"Recordings to scan at once in montage mode (default {DEFAULT_MONTAGE_WORKERS}).")
     parser.add_argument("--feed-region", default="58,0,42,30", metavar="L,T,W,H",
                         help="Montage kill-feed crop as percentages of the full frame.")
-    parser.add_argument("--feed-divider", default="50", metavar="PERCENT",
-                        help="Position of the kill/death split measured from the left edge of the crop.")
+    parser.add_argument("--feed-divider", metavar="PERCENT",
+                        help="Use a fixed split measured from the left edge of the crop. Defaults to per-row detection.")
     parser.add_argument("--feed-text-mode", choices=OCR_MODE_ARGS, default="grayscale",
                         help="Image treatment used on the montage kill-feed crop.")
     parser.add_argument("--any-feed-mention", action="store_true",
@@ -742,7 +801,8 @@ def main():
             validate_detection(fallback_track, args.threshold, args.player, "", before, after)
             feed = KillFeedOptions(parse_feed_region(args.feed_region), args.any_feed_mention,
                                    fallback_track, args.threshold,
-                                   OCR_MODE_ARGS[args.feed_text_mode], parse_feed_divider(args.feed_divider))
+                                   OCR_MODE_ARGS[args.feed_text_mode],
+                                   parse_feed_divider(args.feed_divider) if args.feed_divider is not None else None)
             results, montage = kill_montage(sources, args.player, before, after, args.output,
                                             audio_offset_ms=args.audio_offset_ms, workers=args.workers,
                                             feed=feed)
@@ -750,8 +810,8 @@ def main():
                 if args.show_feed:
                     print(f"{result.source.name}: player seen in {result.feed_mentions} sample(s), "
                           f"{result.feed_matches} matching current rule.")
-                    print(f"  Left side: {result.feed_left_mentions} sample(s); "
-                          f"right side: {result.feed_right_mentions} sample(s).")
+                    print(f"  Left side: {result.feed_left_mentions}, right side: {result.feed_right_mentions}, "
+                          f"side unknown: {result.feed_unknown_mentions} sample(s).")
                     if result.feed_green_mentions is not None:
                         print(f"  Player name marked green in {result.feed_green_mentions} sample(s).")
                     for line, count in result.feed_rows.most_common(12):

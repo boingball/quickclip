@@ -59,6 +59,7 @@ class Desktop:
         self.score = tk.StringVar(value=DEFAULT_SCORE)
         self.feed_region = tk.StringVar(value="58,0,42,30")
         self.feed_divider = tk.StringVar(value="50")
+        self.fixed_feed_divider = tk.BooleanVar()
         self.feed_mode = tk.StringVar(value=OCR_MODES[0])
         self.any_feed_mention = tk.BooleanVar()
         self.audio_fallback = tk.BooleanVar()
@@ -194,6 +195,7 @@ class Desktop:
         self.score_enabled.set(values.get("score_enabled") is True)
         self.any_feed_mention.set(values.get("any_feed_mention") is True)
         self.audio_fallback.set(values.get("audio_fallback") is True)
+        self.fixed_feed_divider.set(values.get("fixed_feed_divider") is True)
         if values.get("feed_mode") in OCR_MODES:
             self.feed_mode.set(values["feed_mode"])
         if isinstance(values.get("output"), str) and values["output"]:
@@ -209,7 +211,8 @@ class Desktop:
                       track=self.track.get(), player=self.player.get(), score=self.score.get(),
                       score_enabled=self.score_enabled.get(), feed_region=self.feed_region.get(),
                       any_feed_mention=self.any_feed_mention.get(), audio_fallback=self.audio_fallback.get(),
-                      feed_mode=self.feed_mode.get(), feed_divider=self.feed_divider.get())
+                      feed_mode=self.feed_mode.get(), feed_divider=self.feed_divider.get(),
+                      fixed_feed_divider=self.fixed_feed_divider.get())
         temp = None
         try:
             self.settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -439,7 +442,7 @@ class Desktop:
         mode = tk.StringVar(frame, value=self.feed_mode.get())
         canvas = tk.Canvas(frame, width=640, height=360, highlightthickness=0, background="black")
         canvas.pack()
-        ttk.Label(frame, text="Load a frame with a visible kill feed and drag a box around it.").pack(anchor="w")
+        ttk.Label(frame, text="Crop the whole feed, leaving room for long names on both sides.").pack(anchor="w")
         controls = ttk.Frame(frame)
         controls.pack(fill="x", pady=(8, 0))
         ttk.Label(controls, text="Left, top, width, height (%)").pack(side="left")
@@ -447,16 +450,19 @@ class Desktop:
         entry = ttk.Entry(controls, textvariable=crop, width=24)
         entry.pack(side="left", padx=6)
         divider = tk.StringVar(frame, value=self.feed_divider.get())
+        fixed = tk.BooleanVar(frame, value=self.fixed_feed_divider.get())
         divider_row = ttk.Frame(frame)
         divider_row.pack(fill="x", pady=(6, 0))
-        ttk.Label(divider_row, text="Kill/death divider (% from left)").pack(side="left")
-        ttk.Entry(divider_row, textvariable=divider, width=7).pack(side="left", padx=6)
-        ttk.Label(divider_row, text="Put the blue line between the killer and victim names.").pack(side="left")
+        ttk.Checkbutton(divider_row, text="Use fixed divider (% from left)", variable=fixed).pack(side="left")
+        divider_entry = ttk.Entry(divider_row, textvariable=divider, width=7)
+        divider_entry.pack(side="left", padx=6)
+        ttk.Label(divider_row, text="Automatic mode finds the gap separately for each row.").pack(side="left")
         origin = None
         photo = None
 
         def outline():
             canvas.delete("crop")
+            divider_entry.configure(state="normal" if fixed.get() else "disabled")
             if photo is not None:
                 try:
                     width, height, left, top = parse_feed_region(crop.get())
@@ -465,6 +471,8 @@ class Desktop:
                 canvas.create_rectangle(left * photo.width(), top * photo.height(),
                                         (left + width) * photo.width(), (top + height) * photo.height(),
                                         outline="#ffe15c", width=2, tags="crop")
+                if not fixed.get():
+                    return
                 try:
                     split = (left + width * parse_feed_divider(divider.get())) * photo.width()
                 except ValueError:
@@ -521,12 +529,14 @@ class Desktop:
         def save():
             try:
                 parse_feed_region(crop.get())
-                parse_feed_divider(divider.get())
+                if fixed.get():
+                    parse_feed_divider(divider.get())
             except ValueError as error:
                 messagebox.showerror("QuickClip", str(error), parent=window)
                 return
             self.feed_region.set(crop.get())
             self.feed_divider.set(divider.get())
+            self.fixed_feed_divider.set(fixed.get())
             self.feed_mode.set(mode.get())
             self.save_settings()
             window.destroy()
@@ -539,18 +549,18 @@ class Desktop:
                 if not math.isfinite(seconds) or seconds < 0:
                     raise ValueError("Enter a nonnegative frame time.")
                 region = parse_feed_region(crop.get())
-                split = parse_feed_divider(divider.get())
+                split = parse_feed_divider(divider.get()) if fixed.get() else None
             except ValueError as error:
                 messagebox.showerror("QuickClip", str(error), parent=window)
                 return
             treatment = mode.get()
-            any_mention = self.any_feed_mention.get()
             self.status.set("Testing kill-feed OCR on one frame…")
-            self.work(lambda: preview_feed(source, seconds, region, treatment, any_mention, split),
+            self.work(lambda: preview_feed(source, seconds, region, treatment, split),
                       lambda value: self.show_ocr_test(value, source.name, seconds, treatment))
 
         crop.trace_add("write", lambda *_: outline())
         divider.trace_add("write", lambda *_: outline())
+        fixed.trace_add("write", lambda *_: outline())
         canvas.bind("<Button-1>", begin)
         canvas.bind("<B1-Motion>", drag)
         canvas.bind("<ButtonRelease-1>", drag)
@@ -561,9 +571,11 @@ class Desktop:
         def reset_area():
             crop.set("58,0,42,30")
             divider.set("50")
+            fixed.set(False)
 
         ttk.Button(controls, text="Reset top-right crop", command=reset_area).pack(side="left")
         ttk.Button(controls, text="Save area", command=save).pack(side="right", padx=(8, 0))
+        outline()
         read_frame()
 
     def show_ocr_test(self, value, filename, seconds, treatment):
@@ -577,16 +589,24 @@ class Desktop:
         canvas = tk.Canvas(frame, width=photo.width(), height=photo.height(), highlightthickness=0)
         canvas.image = photo
         canvas.create_image(0, 0, image=photo, anchor="nw")
-        canvas.create_line(split / 2, 0, split / 2, photo.height(), fill="#1675a4", width=2, dash=(5, 3))
+        if split is not None:
+            canvas.create_line(split / 2, 0, split / 2, photo.height(), fill="#1675a4", width=2, dash=(5, 3))
+        else:
+            for row in rows:
+                if row.divider is not None:
+                    top = min(word.top for word in row.words) / 2
+                    bottom = max(word.top + word.height for word in row.words) / 2
+                    canvas.create_line(row.divider / 2, top, row.divider / 2, bottom,
+                                       fill="#1675a4", width=2)
         canvas.pack(anchor="w")
         detail = tk.Text(frame, width=70, height=9, wrap="word")
         detail.pack(fill="both", expand=True, pady=(8, 0))
         if rows:
             for row in rows:
                 words = " ".join(
-                    f"{word} [{confidence:.0f}, {'left' if centre < split else 'right'}"
-                    f"{', green' if word in row.green_words else ''}]"
-                    for (word, confidence), centre in zip(row.words, row.centres))
+                    f"{word.text} [{word.confidence:.0f}, {row.side(word)}"
+                    f"{', green' if word.green else ''}]"
+                    for word in row.words)
                 detail.insert("end", words + "\n")
             if not any(row.readable for row in rows):
                 detail.insert("end", "\nNo confident name-like text on this frame.")
@@ -602,7 +622,8 @@ class Desktop:
             lines.append(f"Player seen in {result.feed_mentions} sample(s), "
                          f"{result.feed_matches} matching the selected rule.")
             lines.append(f"Left side · {result.feed_left_mentions} sample(s)   "
-                         f"Right side · {result.feed_right_mentions} sample(s)")
+                         f"Right side · {result.feed_right_mentions} sample(s)   "
+                         f"Side unknown · {result.feed_unknown_mentions} sample(s)")
             if result.feed_green_mentions is not None:
                 lines.append(f"Player name marked green in {result.feed_green_mentions} sample(s).")
             names = Counter()
@@ -644,7 +665,8 @@ class Desktop:
                 threshold = float(self.threshold.get()) if fallback else -18
                 feed = KillFeedOptions(parse_feed_region(self.feed_region.get()),
                                        self.any_feed_mention.get(), fallback, threshold, self.feed_mode.get(),
-                                       parse_feed_divider(self.feed_divider.get()))
+                                       parse_feed_divider(self.feed_divider.get())
+                                       if self.fixed_feed_divider.get() else None)
             else:
                 score = self.score.get().strip() if self.score_enabled.get() else ""
                 if self.score_enabled.get() and not score:
@@ -685,7 +707,10 @@ class Desktop:
                     elif any(result.feed_mentions for result in results) and not any(
                             result.feed_matches for result in results):
                         if not feed.any_mention and not any(result.feed_left_mentions for result in results):
-                            status += " Your name was read only on the right. Check the divider in Set kill-feed area."
+                            if any(result.feed_unknown_mentions for result in results):
+                                status += " OCR could not establish your side on some rows. Check that the crop includes both names."
+                            else:
+                                status += " Your name was read only on the victim side. See OCR readout."
                         elif feed.mode == GREEN_PLAYER:
                             status += " No name on the selected side passed the green check. See OCR readout."
                     elif not self.clips:
