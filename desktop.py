@@ -17,7 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 from quickclip import (
     BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, FEED, GREEN_PLAYER, KillFeedOptions, NAME_TOKEN, OCR_MODES,
     RECORDING_EXTENSIONS, export_clip, folder_recordings, parse_feed_divider, parse_feed_region, prepare_output,
-    has_kill_badge, preview_feed, preview_kill_badge, probe, process_batch, run, scan_kills, write_montage,
+    kill_badge_match, preview_feed, preview_kill_badge, probe, process_batch, run, scan_kills, write_montage,
 )
 
 MONTAGE_CUES = ("Kill feed", "KILL badge", "Both")
@@ -741,8 +741,11 @@ class Desktop:
         detail = tk.Text(frame, width=70, height=9, wrap="word")
         detail.pack(fill="both", expand=True, pady=(8, 0))
         if badge:
-            verdict = "Detected" if has_kill_badge(rows) else "No match"
+            evidence = kill_badge_match(image, rows)
+            verdict = "Detected" if evidence else "No match"
             detail.insert("end", f"KILL badge · {verdict} on this frame\n\n")
+            if evidence:
+                detail.insert("end", f"Matched by {evidence}.\n\n")
         if rows:
             for row in rows:
                 if badge:

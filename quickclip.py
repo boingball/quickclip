@@ -395,8 +395,77 @@ def preview_kill_badge(path, seconds):
     return image, rows, None
 
 
-def has_kill_badge(rows):
-    return any(KILL_BADGE_PATTERN.search(row.text) for row in rows)
+def connected_pixels(points):
+    pixels = set(points)
+    while pixels:
+        stack = [pixels.pop()]
+        component = set(stack)
+        while stack:
+            x, y = stack.pop()
+            for point in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                if point in pixels:
+                    pixels.remove(point)
+                    component.add(point)
+                    stack.append(point)
+        yield component
+
+
+def skull_shape(component, score_height):
+    left = min(x for x, _ in component)
+    right = max(x for x, _ in component) + 1
+    top = min(y for _, y in component)
+    bottom = max(y for _, y in component) + 1
+    width, height = right - left, bottom - top
+    if not (.55 * score_height <= height <= 1.6 * score_height
+            and .55 * height <= width <= 1.35 * height):
+        return False
+    jaw = {x for x, y in component if y >= bottom - max(1, height // 5)}
+    if max(jaw) - min(jaw) + 1 > .85 * width:
+        return False
+
+    # Two interior openings on opposite sides distinguish a skull from a generic score icon.
+    background = ((x, y) for y in range(top, bottom) for x in range(left, right)
+                  if (x, y) not in component)
+    eyes = []
+    for hole in connected_pixels(background):
+        if len(hole) < max(2, width * height * .012):
+            continue
+        if any(x in (left, right - 1) or y in (top, bottom - 1) for x, y in hole):
+            continue
+        x = sum(x for x, _ in hole) / len(hole)
+        y = sum(y for _, y in hole) / len(hole)
+        if top + .2 * height <= y <= top + .73 * height:
+            eyes.append((x, y))
+    middle = left + width / 2
+    return any(x1 < middle < x2 and x2 - x1 >= .2 * width and abs(y1 - y2) <= .2 * height
+               for x1, y1 in eyes for x2, y2 in eyes)
+
+
+def skull_next_to_score(frame, score):
+    height = score.height
+    left = max(0, score.left - round(3 * height))
+    right = score.left - max(1, round(.15 * height))
+    top = max(0, score.top - height // 2)
+    bottom = min(OCR_HEIGHT, score.top + round(1.55 * height))
+    ink = set()
+    for y in range(top, bottom):
+        offset = len(OCR_HEADER) + y * OCR_WIDTH
+        ink.update((x, y) for x in range(left, right) if frame[offset + x] < 128)
+    return any(skull_shape(component, height) for component in connected_pixels(ink))
+
+
+def kill_badge_match(frame, rows):
+    if any(KILL_BADGE_PATTERN.search(row.text) for row in rows):
+        return "boxed KILL text"
+    if any(re.search(r"\bKILL\s+ASSIST\b", row.text, re.IGNORECASE) for row in rows):
+        return None
+    for row in rows:
+        for word in row.words:
+            if (word.confidence >= 70 and word.height >= 8
+                    and re.fullmatch(r"[0-9]{2,4}", word.text)
+                    and skull_next_to_score(frame, word)):
+                return f"skull beside score {word.text}"
+    return None
 
 
 def ocr_events(path, region, reason, identify, duration, progress, *,
@@ -418,9 +487,10 @@ def ocr_events(path, region, reason, identify, duration, progress, *,
             if index % 20 == 0:
                 progress(f"Scanning {reason.lower()} at {timestamp:.0f} / {duration:.0f}s")
             if data != last_frame:
-                rows = read_ocr_frame(OCR_HEADER + data, page_mode, tesseract_env, mode)
+                frame = OCR_HEADER + data
+                rows = read_ocr_frame(frame, page_mode, tesseract_env, mode)
                 last_frame = data
-            matches = identify(rows)
+            matches = identify(rows, frame)
             previous = set().union(*recent)
             if matches - previous:
                 yield timestamp, reason
@@ -491,7 +561,7 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         divider = (feed_divider_x(recording.frame_size, feed.region, feed.divider)
                    if feed and feed.divider is not None else None)
 
-        def feed_matches(rows):
+        def feed_matches(rows, _frame):
             if feed:
                 rows = position_feed_rows(rows, divider)
             lines = {row.text.casefold() for row in rows}
@@ -540,8 +610,8 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         if diagnostics is not None:
             diagnostics.badge_samples = 0
 
-        def badge_matches(rows):
-            if has_kill_badge(rows):
+        def badge_matches(rows, frame):
+            if kill_badge_match(frame, rows):
                 if diagnostics is not None:
                     diagnostics.badge_samples += 1
                 return {"KILL"}
@@ -551,7 +621,7 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                                  recording.duration, progress, page_mode=KILL_BADGE_PAGE_MODE,
                                  stop=stop, mode=KILL_BADGE_MODE))
     if score_pattern:
-        def score_matches(rows):
+        def score_matches(rows, _frame):
             text = "\n".join(row.text for row in rows)
             return {"".join(match.group().upper().split()) for match in score_pattern.finditer(text)}
 
