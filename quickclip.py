@@ -239,10 +239,15 @@ def export_clip(source, clip, directory, progress=print):
     stem = f"{source.stem}_{round(clip.start * 1000):09d}_{round(clip.end * 1000):09d}"
     with tempfile.TemporaryDirectory(prefix=".quickclip-", dir=directory) as temp:
         encoded = Path(temp) / "clip.mkv"
+        # Seek near the clip, then decode a lead-in before cutting audio and video together.
+        seek = max(0, clip.start - 5)
         command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                   "-filter_threads", "1", "-ss", f"{clip.start:.3f}"]
-        streams = ["-i", str(source), "-t", f"{clip.end - clip.start:.3f}",
+                   "-filter_threads", "1", "-ss", f"{seek:.3f}"]
+        streams = ["-i", str(source), "-ss", f"{clip.start - seek:.3f}",
+                   "-t", f"{clip.end - clip.start:.3f}",
                    "-map", "0:V:0", "-map", "0:a?", "-map_chapters", "-1",
+                   # Preserve the recording's frame cadence and audio timestamp gaps.
+                   "-fps_mode", "passthrough", "-af", "aresample=async=1",
                    "-c:v", "libx264", "-crf", "18", "-c:a", "flac"]
         try:
             run(command + ["-threads:v", "2"] + streams
