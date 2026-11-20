@@ -331,7 +331,7 @@ def process_batch(sources, options, output=None, progress=print, *, audio_offset
             result.errors.append(str(error))
         if output is not None:
             for count, clip in enumerate(result.clips, 1):
-                report(f"Exporting clip {count}/{len(result.clips)}")
+                report(f"Exporting clip {count}/{len(result.clips)} ({clip.start:.2f}–{clip.end:.2f}s)")
                 try:
                     result.exports.append(export_clip(source, clip, output, progress=report,
                                                       audio_offset_ms=audio_offset_ms))
@@ -402,22 +402,29 @@ def main():
     parser.add_argument("--before", type=float, help="Seconds before each cue (10; 3 for montage).")
     parser.add_argument("--after", type=float, help="Seconds after each cue (6; 2 for montage).")
     parser.add_argument("--output", type=Path, help="Export every candidate here. Omit to list candidates.")
+    parser.add_argument("--files", type=int, metavar="N",
+                        help="Process only the first N recordings in a folder, sorted by filename.")
     parser.add_argument("--kill-montage", action="store_true",
                         help="Join kill-feed matches into one MKV. Requires --player and --output.")
     parser.add_argument("--audio-offset-ms", type=int, default=0,
                         help="Shift all exported audio tracks. Negative brings audio earlier; positive delays it.")
     args = parser.parse_args()
+    is_folder = args.recording is not None and args.recording.is_dir()
+    if args.files is not None and (args.files < 1 or not is_folder):
+        parser.error("--files requires a folder and a positive whole number.")
     if args.recording is None:
         from desktop import launch
         launch()
         return
     try:
+        sources = folder_recordings(args.recording) if is_folder else [args.recording]
+        if args.files is not None:
+            sources = sources[:args.files]
         before = args.before if args.before is not None else (3 if args.kill_montage else 10)
         after = args.after if args.after is not None else (2 if args.kill_montage else 6)
         if args.kill_montage:
             if args.output is None:
                 raise ValueError("--kill-montage requires an output folder.")
-            sources = folder_recordings(args.recording) if args.recording.is_dir() else [args.recording]
             results, montage = kill_montage(sources, args.player, before, after, args.output,
                                             audio_offset_ms=args.audio_offset_ms)
             for result in results:
@@ -432,8 +439,7 @@ def main():
         if track is None:
             track = 0 if args.player.strip() or score else "auto"
         options = (track, args.threshold, args.player, score, before, after)
-        if args.recording.is_dir():
-            sources = folder_recordings(args.recording)
+        if is_folder:
             failed = 0
             candidates = 0
             exported = 0

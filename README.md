@@ -71,4 +71,6 @@ py quickclip.py "F:\Raw-Stream" --player boingball --kill-montage --output "F:\Q
 
 The command uses three seconds before and two after each match by default. Override them with `--before` and `--after`. Use `--audio-offset-ms 1000` if the recordings need that sync adjustment.
 
+Add `--files 5` to try the first five recordings in filename order. This limits the number of source files scanned. Each recording can still yield multiple highlights.
+
 If all audio tracks play late in an exported clip, try `--audio-offset-ms -1000` to bring them one second earlier. The desktop app has the same **Export audio offset (ms)** setting. Positive values delay audio. The offset applies to all tracks during export and defaults to zero.
