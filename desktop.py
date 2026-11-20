@@ -17,7 +17,7 @@ from tkinter import filedialog, messagebox, ttk
 from quickclip import (
     BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, FEED, GREEN_PLAYER, KillFeedOptions, NAME_TOKEN, OCR_MODES,
     RECORDING_EXTENSIONS, export_clip, folder_recordings, parse_feed_divider, parse_feed_region, prepare_output,
-    preview_feed, probe, process_batch, run, scan_kills, write_montage,
+    has_kill_badge, preview_feed, preview_kill_badge, probe, process_batch, run, scan_kills, write_montage,
 )
 
 MONTAGE_CUES = ("Kill feed", "KILL badge", "Both")
@@ -654,7 +654,7 @@ class Desktop:
             self.save_settings()
             close_area()
 
-        def test_ocr():
+        def test_ocr(badge=False):
             if self.busy:
                 return
             try:
@@ -662,25 +662,32 @@ class Desktop:
             except ValueError:
                 messagebox.showerror("QuickClip", "Enter a nonnegative frame time.", parent=window)
                 return
-            try:
-                region = parse_feed_region(crop.get())
-                split = parse_feed_divider(divider.get()) if fixed.get() else None
-            except ValueError as error:
-                messagebox.showerror("QuickClip", str(error), parent=window)
-                return
-            treatment = mode.get()
             requested_source = source
-            self.status.set("Testing kill-feed OCR on one frame…")
+            if badge:
+                treatment = "KILL badge"
+                def operation():
+                    return preview_kill_badge(requested_source, seconds)
+            else:
+                try:
+                    region = parse_feed_region(crop.get())
+                    split = parse_feed_divider(divider.get()) if fixed.get() else None
+                except ValueError as error:
+                    messagebox.showerror("QuickClip", str(error), parent=window)
+                    return
+                treatment = mode.get()
+                def operation():
+                    return preview_feed(requested_source, seconds, region, treatment, split)
+            self.status.set("Testing KILL badge OCR…" if badge else "Testing kill-feed OCR…")
 
             def complete(value):
                 if not window.winfo_exists():
                     return
                 if requested_source == source:
-                    self.show_ocr_test(value, requested_source.name, seconds, treatment)
+                    self.show_ocr_test(value, requested_source.name, seconds, treatment, badge=badge)
                 else:
                     read_frame()
 
-            self.work(lambda: preview_feed(requested_source, seconds, region, treatment, split), complete)
+            self.work(operation, complete)
 
         crop.trace_add("write", lambda *_: outline())
         divider.trace_add("write", lambda *_: outline())
@@ -696,7 +703,8 @@ class Desktop:
         use_time.pack(side="left", padx=6)
         ttk.Label(playback_controls, text="In the player, use Space to pause and the arrow keys to seek.").pack(side="left")
         ttk.Button(tools, text="Load frame", command=read_frame).pack(side="left")
-        ttk.Button(tools, text="Test OCR", command=test_ocr).pack(side="right")
+        ttk.Button(tools, text="Test KILL badge", command=lambda: test_ocr(badge=True)).pack(side="right", padx=(6, 0))
+        ttk.Button(tools, text="Test feed OCR", command=test_ocr).pack(side="right")
         ttk.Combobox(tools, textvariable=mode, values=OCR_MODES, state="readonly",
                      width=13).pack(side="right", padx=6)
         def reset_area():
@@ -709,10 +717,10 @@ class Desktop:
         outline()
         read_frame()
 
-    def show_ocr_test(self, value, filename, seconds, treatment):
+    def show_ocr_test(self, value, filename, seconds, treatment, *, badge=False):
         image, rows, split = value
         dialog = tk.Toplevel(self.root)
-        dialog.title("Kill-feed OCR test")
+        dialog.title("KILL badge OCR test" if badge else "Kill-feed OCR test")
         frame = ttk.Frame(dialog, padding=12)
         frame.pack(fill="both", expand=True)
         ttk.Label(frame, text=f"{filename} · {seconds:g}s · {treatment}").pack(anchor="w", pady=(0, 6))
@@ -732,19 +740,25 @@ class Desktop:
         canvas.pack(anchor="w")
         detail = tk.Text(frame, width=70, height=9, wrap="word")
         detail.pack(fill="both", expand=True, pady=(8, 0))
+        if badge:
+            verdict = "Detected" if has_kill_badge(rows) else "No match"
+            detail.insert("end", f"KILL badge · {verdict} on this frame\n\n")
         if rows:
             for row in rows:
-                words = " ".join(
-                    f"{word.text} [{word.confidence:.0f}, {row.side(word)}"
-                    f"{', green' if word.green else ''}]"
-                    for word in row.words)
+                if badge:
+                    words = " ".join(f"{word.text} [{word.confidence:.0f}]" for word in row.words)
+                else:
+                    words = " ".join(
+                        f"{word.text} [{word.confidence:.0f}, {row.side(word)}"
+                        f"{', green' if word.green else ''}]"
+                        for word in row.words)
                 detail.insert("end", words + "\n")
-            if not any(row.readable for row in rows):
+            if not badge and not any(row.readable for row in rows):
                 detail.insert("end", "\nNo confident name-like text on this frame.")
         else:
             detail.insert("end", "Tesseract read no text on this frame.")
         detail.configure(state="disabled")
-        self.status.set("Kill-feed OCR test complete.")
+        self.status.set("KILL badge OCR test complete." if badge else "Kill-feed OCR test complete.")
 
     def show_feed_results(self):
         lines = []
@@ -774,7 +788,7 @@ class Desktop:
                 lines.append(f"Possible names and words · {names_list}")
                 lines.extend(f"  {count} × {line}" for line, count in result.feed_rows.most_common(12))
             else:
-                lines.append("No confident name-like text. Use Test OCR on a frame with the feed visible.")
+                lines.append("No confident name-like text. Use Test feed OCR on a frame with the feed visible.")
             if result.feed_uncertain_rows:
                 lines.append(f"Skipped {result.feed_uncertain_rows} low-confidence or non-name OCR row(s).")
             lines.append("")
@@ -849,7 +863,7 @@ class Desktop:
                     status += " Play clips and untick any you want to leave out."
                 if not failures and player:
                     if not any(NAME_TOKEN.search(line) for result in results for line in result.feed_rows):
-                        status += " No confident name-like text. Use Test OCR in Set kill-feed area."
+                        status += " No confident name-like text. Use Test feed OCR in Set kill-feed area."
                     elif any(result.feed_mentions or result.feed_lookalikes for result in results) and not any(
                             result.feed_matches for result in results):
                         if not feed.any_mention and not any(result.feed_left_mentions for result in results):

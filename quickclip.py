@@ -170,6 +170,8 @@ OCR_LOOKALIKES = ("o0", "il1", "s5", "b8", "z2")
 GREEN_PLAYER = "Green player"
 FAINT_TEXT = "Faint text"
 OCR_MODES = ("Grayscale", "Bright text", "Colored HUD", GREEN_PLAYER, FAINT_TEXT)
+KILL_BADGE_MODE = OCR_MODES[1]
+KILL_BADGE_PAGE_MODE = "11"
 OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored", "green", "faint"), OCR_MODES))
 OCR_WIDTH, OCR_HEIGHT = 960, 480
 OCR_HEADER = f"P5\n{OCR_WIDTH} {OCR_HEIGHT}\n255\n".encode("ascii")
@@ -370,7 +372,7 @@ def read_ocr_frame(frame, page_mode, environment, mode):
     return tuple(OCRRow(tuple(words)) for words in lines.values())
 
 
-def preview_feed(path, seconds, region, mode, divider=None):
+def preview_ocr_frame(path, seconds, region, mode, page_mode):
     pixels = run(["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{seconds:.3f}",
                   "-filter_threads", "1", "-threads:v", "1", "-i", str(path), "-map", "0:V:0",
                   "-an", "-frames:v", "1", "-vf", ocr_filter(region, mode), "-threads:v", "1",
@@ -378,9 +380,23 @@ def preview_feed(path, seconds, region, mode, divider=None):
     if len(pixels) != OCR_WIDTH * OCR_HEIGHT:
         raise ValueError("No preview frame at that time. Try an earlier frame.")
     image = OCR_HEADER + pixels
-    rows = read_ocr_frame(image, "6", {**os.environ, "OMP_THREAD_LIMIT": "1"}, mode)
+    rows = read_ocr_frame(image, page_mode, {**os.environ, "OMP_THREAD_LIMIT": "1"}, mode)
+    return image, rows
+
+
+def preview_feed(path, seconds, region, mode, divider=None):
+    image, rows = preview_ocr_frame(path, seconds, region, mode, "6")
     split = feed_divider_x(probe(path).frame_size, region, divider) if divider is not None else None
     return image, position_feed_rows(rows, split), split
+
+
+def preview_kill_badge(path, seconds):
+    image, rows = preview_ocr_frame(path, seconds, KILL_BADGE_REGION, KILL_BADGE_MODE, KILL_BADGE_PAGE_MODE)
+    return image, rows, None
+
+
+def has_kill_badge(rows):
+    return any(KILL_BADGE_PATTERN.search(row.text) for row in rows)
 
 
 def ocr_events(path, region, reason, identify, duration, progress, *,
@@ -525,14 +541,15 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
             diagnostics.badge_samples = 0
 
         def badge_matches(rows):
-            if any(KILL_BADGE_PATTERN.search(row.text) for row in rows):
+            if has_kill_badge(rows):
                 if diagnostics is not None:
                     diagnostics.badge_samples += 1
                 return {"KILL"}
             return set()
 
         events.extend(ocr_events(path, KILL_BADGE_REGION, "KILL badge", badge_matches,
-                                 recording.duration, progress, stop=stop, mode=OCR_MODES[1]))
+                                 recording.duration, progress, page_mode=KILL_BADGE_PAGE_MODE,
+                                 stop=stop, mode=KILL_BADGE_MODE))
     if score_pattern:
         def score_matches(rows):
             text = "\n".join(row.text for row in rows)
