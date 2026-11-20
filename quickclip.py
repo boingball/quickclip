@@ -234,20 +234,23 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
     return find_clips(events, recording.duration, before, after)
 
 
-def export_clip(source, clip, directory, progress=print):
+def export_clip(source, clip, directory, progress=print, *, audio_offset_ms=0):
     directory.mkdir(parents=True, exist_ok=True)
     stem = f"{source.stem}_{round(clip.start * 1000):09d}_{round(clip.end * 1000):09d}"
     with tempfile.TemporaryDirectory(prefix=".quickclip-", dir=directory) as temp:
         encoded = Path(temp) / "clip.mkv"
         # Seek near the clip, then decode a lead-in before cutting audio and video together.
-        seek = max(0, clip.start - 5)
+        seek = max(0, clip.start - 5 - max(0, audio_offset_ms / 1000))
+        audio_filter = "aresample=async=1"
+        if audio_offset_ms:
+            audio_filter += f",asetpts=PTS+({audio_offset_ms}/1000)/TB"
         command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                    "-filter_threads", "1", "-ss", f"{seek:.3f}"]
         streams = ["-i", str(source), "-ss", f"{clip.start - seek:.3f}",
                    "-t", f"{clip.end - clip.start:.3f}",
                    "-map", "0:V:0", "-map", "0:a?", "-map_chapters", "-1",
                    # Preserve the recording's frame cadence and audio timestamp gaps.
-                   "-fps_mode", "passthrough", "-af", "aresample=async=1",
+                   "-fps_mode", "passthrough", "-af", audio_filter,
                    "-c:v", "libx264", "-crf", "18", "-c:a", "flac"]
         try:
             run(command + ["-threads:v", "2"] + streams
@@ -293,7 +296,7 @@ def prepare_output(sources, output):
     output.mkdir(parents=True, exist_ok=True)
 
 
-def process_batch(sources, options, output=None, progress=print):
+def process_batch(sources, options, output=None, progress=print, *, audio_offset_ms=0):
     validate_detection(*options)
     for program in ("ffmpeg", "ffprobe"):
         if not shutil.which(program):
@@ -318,7 +321,8 @@ def process_batch(sources, options, output=None, progress=print):
             for count, clip in enumerate(result.clips, 1):
                 report(f"Exporting clip {count}/{len(result.clips)}")
                 try:
-                    result.exports.append(export_clip(source, clip, output, progress=report))
+                    result.exports.append(export_clip(source, clip, output, progress=report,
+                                                      audio_offset_ms=audio_offset_ms))
                 except (OSError, RuntimeError) as error:
                     result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
         yield result
@@ -345,6 +349,8 @@ def main():
     parser.add_argument("--before", type=float, default=10)
     parser.add_argument("--after", type=float, default=6)
     parser.add_argument("--output", type=Path, help="Export every candidate here. Omit to list candidates.")
+    parser.add_argument("--audio-offset-ms", type=int, default=0,
+                        help="Shift all exported audio tracks. Negative brings audio earlier; positive delays it.")
     args = parser.parse_args()
     if args.recording is None:
         from desktop import launch
@@ -361,7 +367,7 @@ def main():
             failed = 0
             candidates = 0
             exported = 0
-            for result in process_batch(sources, options, args.output):
+            for result in process_batch(sources, options, args.output, audio_offset_ms=args.audio_offset_ms):
                 candidates += len(result.clips)
                 exported += len(result.exports)
                 failed += bool(result.errors)
@@ -383,7 +389,7 @@ def main():
         for clip in clips:
             print(f"{clip.start:.2f}–{clip.end:.2f}s  {', '.join(clip.reasons)}")
             if args.output is not None:
-                print(export_clip(args.recording, clip, args.output))
+                print(export_clip(args.recording, clip, args.output, audio_offset_ms=args.audio_offset_ms))
         print(f"{len(clips)} highlight candidate(s).")
     except (OSError, RuntimeError, ValueError, re.error) as error:
         parser.exit(1, f"QuickClip: {error}\n")

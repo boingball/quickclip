@@ -60,6 +60,8 @@ class Desktop:
         self.threshold = ttk.Entry(settings, width=8)
         self.before = ttk.Entry(settings, width=8)
         self.after = ttk.Entry(settings, width=8)
+        self.audio_offset = ttk.Entry(settings, width=8)
+        self.audio_offset.insert(0, "0")
         for field, value in ((self.threshold, "-18"), (self.before, "10"), (self.after, "6")):
             field.insert(0, value)
         settings_fields = (
@@ -69,6 +71,7 @@ class Desktop:
             ("Seconds before", self.before, 1, 2),
             ("Score text pattern", ttk.Entry(settings, textvariable=self.score), 2, 0),
             ("Seconds after", self.after, 2, 2),
+            ("Export audio offset (ms)", self.audio_offset, 4, 0),
         )
         for label, field, row, column in settings_fields:
             ttk.Label(settings, text=label).grid(row=row, column=column, sticky="w", padx=(0, 8))
@@ -220,6 +223,7 @@ class Desktop:
                        float(self.before.get()), float(self.after.get()))
             if self.score_enabled.get() and not options[3]:
                 raise ValueError("Enter a score text pattern.")
+            audio_offset = self.read_audio_offset() if auto_export else 0
         except ValueError as error:
             messagebox.showerror("QuickClip", str(error))
             return
@@ -255,7 +259,8 @@ class Desktop:
 
         self.status.set("Scanning recordings…")
         self.work(lambda: list(process_batch(self.sources, options, output,
-                                            progress=lambda msg: self.messages.put(("progress", msg)))),
+                                            progress=lambda msg: self.messages.put(("progress", msg)),
+                                            audio_offset_ms=audio_offset)),
                   complete)
 
     def show_failures(self, failures):
@@ -283,7 +288,18 @@ class Desktop:
         except OSError as error:
             messagebox.showerror("QuickClip", str(error))
 
+    def read_audio_offset(self):
+        try:
+            return int(self.audio_offset.get())
+        except ValueError as error:
+            raise ValueError("Enter the export audio offset in whole milliseconds. Negative brings audio earlier.") from error
+
     def export(self):
+        try:
+            audio_offset = self.read_audio_offset()
+        except ValueError as error:
+            messagebox.showerror("QuickClip", str(error))
+            return
         clips = [self.clips[int(index)] for index in self.table.selection()]
         directory = self.output or self.default_output or self.choose_output()
         if directory is None:
@@ -295,7 +311,8 @@ class Desktop:
             for index, (source, clip) in enumerate(clips, 1):
                 self.messages.put(("progress", f"Exporting clip {index} of {len(clips)}…"))
                 export_clip(source, clip, directory,
-                            progress=lambda msg: self.messages.put(("progress", msg)))
+                            progress=lambda msg: self.messages.put(("progress", msg)),
+                            audio_offset_ms=audio_offset)
             return len(clips)
 
         self.work(operation, lambda count: self.status.set(f"Exported {count} clip(s) to {directory}"))

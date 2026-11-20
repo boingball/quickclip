@@ -56,3 +56,5 @@ py quickclip.py "D:\OBS\Recordings" --mic-track 2 --threshold -18 --output "D:\O
 ```
 
 Omit `--output` to list candidates without exporting. A batch with errors still processes the other recordings and returns a nonzero exit code.
+
+If all audio tracks play late in an exported clip, try `--audio-offset-ms -1000` to bring them one second earlier. The desktop app has the same **Export audio offset (ms)** setting. Positive values delay audio. The offset applies to all tracks during export and defaults to zero.
