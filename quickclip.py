@@ -38,6 +38,7 @@ class BatchResult:
     clips: list[Clip]
     exports: list[Path]
     errors: list[str]
+    feed_scanned: bool = False
     feed_rows: Counter = field(default_factory=Counter)
     feed_mentions: int = 0
     feed_left_mentions: int = 0
@@ -46,6 +47,7 @@ class BatchResult:
     feed_green_mentions: int | None = None
     feed_lookalikes: Counter = field(default_factory=Counter)
     feed_matches: int = 0
+    badge_samples: int | None = None
     feed_uncertain_rows: int = 0
 
 
@@ -160,6 +162,8 @@ def microphone_events(levels, threshold, duration, reason, progress, *, stop=Non
 # Fractions of the full video, in width, height, left, top order.
 FEED = (.42, .30, .58, .0)
 SCORE = (.44, .38, .28, .34)
+KILL_BADGE_REGION = (.48, .20, .16, .60)
+KILL_BADGE_PATTERN = re.compile(r"\bKILL\b(?!\s+ASSIST\b)", re.IGNORECASE)
 DEFAULT_SCORE = r"\+\s*[0-9]{2,5}\b|\b[0-9]{2,5}\s*XP\b"
 NAME_TOKEN = re.compile(r"(?=[\w.-]*[^\W\d_])[\w.-]{3,32}")
 OCR_LOOKALIKES = ("o0", "il1", "s5", "b8", "z2")
@@ -237,6 +241,7 @@ class KillFeedOptions:
     threshold: float = -18
     mode: str = OCR_MODES[0]
     divider: float | None = None
+    badge: bool = False
 
 
 def parse_feed_region(text):
@@ -422,7 +427,7 @@ def find_clips(events, duration, before, after):
     return clips
 
 
-def validate_detection(track, threshold, player, score, before, after):
+def validate_detection(track, threshold, player, score, before, after, *, badge=False):
     if track != "auto" and track < 0:
         raise ValueError("Choose a positive audio track number, or use 0 to disable.")
     if not math.isfinite(threshold) or not -90 <= threshold <= 0:
@@ -431,23 +436,24 @@ def validate_detection(track, threshold, player, score, before, after):
         raise ValueError("Lead-in must be nonnegative and follow-through must be positive.")
     player = player.strip()
     score_pattern = re.compile(score, re.IGNORECASE) if score else None
-    if not (track or player or score_pattern):
-        raise ValueError("Enable the mic, kill feed, or score detector.")
-    if (player or score_pattern) and not shutil.which("tesseract"):
+    if not (track or player or score_pattern or badge):
+        raise ValueError("Enable the mic, kill feed, KILL badge, or score detector.")
+    if (player or score_pattern or badge) and not shutil.which("tesseract"):
         raise RuntimeError("Install Tesseract with English language data for on-screen detection.")
     return player, score_pattern
 
 
 def scan(path, recording, track, threshold, player, score, before, after, progress=print,
          *, feed=None, diagnostics=None, stop=None):
-    player, score_pattern = validate_detection(track, threshold, player, score, before, after)
+    badge = feed is not None and feed.badge
+    player, score_pattern = validate_detection(track, threshold, player, score, before, after, badge=badge)
     levels = None
     auto = track == "auto"
     if auto:
         try:
             track, levels = detect_mic_track(path, recording, progress)
         except ValueError as error:
-            if not (player or score_pattern):
+            if not (player or score_pattern or badge):
                 raise
             progress(f"Mic detection skipped: {error}")
             track = 0
@@ -460,6 +466,8 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         reason = f"Mic peak (track {track})" if auto else "Mic peak"
         events.extend(microphone_events(levels, threshold, recording.duration, reason, progress))
     if player:
+        if diagnostics is not None:
+            diagnostics.feed_scanned = True
         killer_only = feed is not None and not feed.any_mention
         green_only = feed is not None and feed.mode == GREEN_PLAYER
         player_pattern = player_name_pattern(player)
@@ -512,6 +520,19 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         events.extend(ocr_events(path, feed.region if feed else FEED, "Kill feed", feed_matches,
                                  recording.duration, progress, page_mode="6" if feed else "11",
                                  stop=stop, mode=feed.mode if feed else OCR_MODES[0]))
+    if badge:
+        if diagnostics is not None:
+            diagnostics.badge_samples = 0
+
+        def badge_matches(rows):
+            if any(KILL_BADGE_PATTERN.search(row.text) for row in rows):
+                if diagnostics is not None:
+                    diagnostics.badge_samples += 1
+                return {"KILL"}
+            return set()
+
+        events.extend(ocr_events(path, KILL_BADGE_REGION, "KILL badge", badge_matches,
+                                 recording.duration, progress, stop=stop, mode=OCR_MODES[1]))
     if score_pattern:
         def score_matches(rows):
             text = "\n".join(row.text for row in rows)
@@ -608,8 +629,8 @@ def prepare_output(sources, output):
     output.mkdir(parents=True, exist_ok=True)
 
 
-def validate_batch(options):
-    validate_detection(*options)
+def validate_batch(options, *, badge=False):
+    validate_detection(*options, badge=badge)
     for program in ("ffmpeg", "ffprobe"):
         if not shutil.which(program):
             raise RuntimeError(f"Install {program} and add it to PATH.")
@@ -698,12 +719,12 @@ def pad_montage_audio(path, present, expected):
 
 def scan_kills(sources, player, before, after, progress=print, *,
                workers=DEFAULT_MONTAGE_WORKERS, stop=None, feed=KillFeedOptions()):
-    if not player.strip():
+    if not player.strip() and not feed.badge:
         raise ValueError("Enter your player name to make a kill montage.")
     if workers < 1:
         raise ValueError("Choose at least one montage scan worker.")
     options = (0, feed.threshold, player, "", before, after)
-    validate_batch(options)
+    validate_batch(options, badge=feed.badge)
     if not sources:
         return
     if stop is None:
@@ -797,7 +818,9 @@ def main():
     parser.add_argument("--files", type=int, metavar="N",
                         help="Process only the first N recordings in a folder, sorted by filename.")
     parser.add_argument("--kill-montage", action="store_true",
-                        help="Join kill-feed matches into one MKV. Requires --player and --output.")
+                        help="Join kill matches into one MKV. Requires --output and either --player or --kill-badge.")
+    parser.add_argument("--kill-badge", action="store_true",
+                        help="Detect Battlefield's on-screen KILL label in montage mode. Omit --player for badge only.")
     parser.add_argument("--workers", type=int, default=DEFAULT_MONTAGE_WORKERS,
                         help=f"Recordings to scan at once in montage mode (default {DEFAULT_MONTAGE_WORKERS}).")
     parser.add_argument("--feed-region", default="58,0,42,30", metavar="L,T,W,H",
@@ -832,16 +855,20 @@ def main():
             if args.output is None:
                 raise ValueError("--kill-montage requires an output folder.")
             fallback_track = (args.mic_track if args.mic_track else "auto") if args.montage_audio_fallback else 0
-            validate_detection(fallback_track, args.threshold, args.player, "", before, after)
+            validate_detection(fallback_track, args.threshold, args.player, "", before, after,
+                               badge=args.kill_badge)
             feed = KillFeedOptions(parse_feed_region(args.feed_region), args.any_feed_mention,
                                    fallback_track, args.threshold,
                                    OCR_MODE_ARGS[args.feed_text_mode],
-                                   parse_feed_divider(args.feed_divider) if args.feed_divider is not None else None)
+                                   parse_feed_divider(args.feed_divider) if args.feed_divider is not None else None,
+                                   args.kill_badge)
             results, montage = kill_montage(sources, args.player, before, after, args.output,
                                             audio_offset_ms=args.audio_offset_ms, workers=args.workers,
                                             feed=feed)
             for result in results:
-                if args.show_feed:
+                if args.show_feed and result.badge_samples is not None:
+                    print(f"{result.source.name}: KILL badge seen in {result.badge_samples} sample(s).")
+                if args.show_feed and result.feed_scanned:
                     print(f"{result.source.name}: exact player name seen in {result.feed_mentions} sample(s), "
                           f"{result.feed_matches} matching current rule.")
                     print(f"  Left side: {result.feed_left_mentions}, right side: {result.feed_right_mentions}, "

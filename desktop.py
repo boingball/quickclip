@@ -15,10 +15,12 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from quickclip import (
-    BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, GREEN_PLAYER, KillFeedOptions, NAME_TOKEN, OCR_MODES,
+    BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, FEED, GREEN_PLAYER, KillFeedOptions, NAME_TOKEN, OCR_MODES,
     RECORDING_EXTENSIONS, export_clip, folder_recordings, parse_feed_divider, parse_feed_region, prepare_output,
     preview_feed, probe, process_batch, run, scan_kills, write_montage,
 )
+
+MONTAGE_CUES = ("Kill feed", "KILL badge", "Both")
 
 
 def clock(seconds):
@@ -94,6 +96,7 @@ class Desktop:
         self.feed_mode = tk.StringVar(value=OCR_MODES[0])
         self.any_feed_mention = tk.BooleanVar()
         self.audio_fallback = tk.BooleanVar()
+        self.montage_cue = tk.StringVar(value=MONTAGE_CUES[0])
 
         root.title("QuickClip")
         root.minsize(720, 460)
@@ -158,6 +161,9 @@ class Desktop:
             row=7, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(settings, text="Use loud audio if no kill matches", variable=self.audio_fallback).grid(
             row=7, column=2, columnspan=2, sticky="w")
+        ttk.Label(settings, text="Montage cues").grid(row=8, column=0, sticky="w")
+        ttk.Combobox(settings, textvariable=self.montage_cue, values=MONTAGE_CUES,
+                     state="readonly").grid(row=8, column=1, sticky="ew", padx=(0, 12), pady=3)
 
         results = ttk.Frame(body)
         results.pack(fill="both", expand=True)
@@ -229,6 +235,8 @@ class Desktop:
         self.fixed_feed_divider.set(values.get("fixed_feed_divider") is True)
         if values.get("feed_mode") in OCR_MODES:
             self.feed_mode.set(values["feed_mode"])
+        if values.get("montage_cue") in MONTAGE_CUES:
+            self.montage_cue.set(values["montage_cue"])
         if isinstance(values.get("output"), str) and values["output"]:
             self.output = Path(values["output"])
             self.show_output()
@@ -243,7 +251,7 @@ class Desktop:
                       score_enabled=self.score_enabled.get(), feed_region=self.feed_region.get(),
                       any_feed_mention=self.any_feed_mention.get(), audio_fallback=self.audio_fallback.get(),
                       feed_mode=self.feed_mode.get(), feed_divider=self.feed_divider.get(),
-                      fixed_feed_divider=self.fixed_feed_divider.get())
+                      fixed_feed_divider=self.fixed_feed_divider.get(), montage_cue=self.montage_cue.get())
         temp = None
         try:
             self.settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -742,6 +750,11 @@ class Desktop:
         lines = []
         for result in sorted(self.feed_results, key=lambda result: result.source.name.casefold()):
             lines.append(result.source.name)
+            if result.badge_samples is not None:
+                lines.append(f"KILL badge seen in {result.badge_samples} sample(s).")
+            if not result.feed_scanned:
+                lines.append("")
+                continue
             lines.append(f"Exact player name seen in {result.feed_mentions} sample(s), "
                          f"{result.feed_matches} matching the selected rule.")
             lines.append(f"Left side · {result.feed_left_mentions} sample(s)   "
@@ -765,7 +778,7 @@ class Desktop:
             if result.feed_uncertain_rows:
                 lines.append(f"Skipped {result.feed_uncertain_rows} low-confidence or non-name OCR row(s).")
             lines.append("")
-        self.show_details("Kill-feed OCR readout", "\n".join(lines))
+        self.show_details("Montage OCR readout", "\n".join(lines))
 
     def start_scan(self, auto_export=False, montage=False):
         player = self.player.get().strip()
@@ -776,7 +789,11 @@ class Desktop:
             selection = self.track.current()
             track = "auto" if selection == 0 else selection - 1
             if montage:
-                if not player:
+                cue = self.montage_cue.get()
+                badge = cue in MONTAGE_CUES[1:]
+                if cue == "KILL badge":
+                    player = ""
+                elif not player:
                     raise ValueError("Enter your player name to make a kill montage.")
                 limit = self.montage_limit.get().strip()
                 if limit:
@@ -789,10 +806,13 @@ class Desktop:
                 workers = int(workers)
                 fallback = (track or "auto") if self.audio_fallback.get() else 0
                 threshold = float(self.threshold.get()) if fallback else -18
-                feed = KillFeedOptions(parse_feed_region(self.feed_region.get()),
-                                       self.any_feed_mention.get(), fallback, threshold, self.feed_mode.get(),
-                                       parse_feed_divider(self.feed_divider.get())
-                                       if self.fixed_feed_divider.get() else None)
+                feed = KillFeedOptions(
+                    region=parse_feed_region(self.feed_region.get()) if player else FEED,
+                    any_mention=self.any_feed_mention.get(), fallback_track=fallback,
+                    threshold=threshold, mode=self.feed_mode.get(), badge=badge,
+                    divider=parse_feed_divider(self.feed_divider.get())
+                    if player and self.fixed_feed_divider.get() else None,
+                )
             else:
                 score = self.score.get().strip() if self.score_enabled.get() else ""
                 if self.score_enabled.get() and not score:
@@ -827,7 +847,7 @@ class Desktop:
             if montage:
                 if self.clips:
                     status += " Play clips and untick any you want to leave out."
-                if not failures:
+                if not failures and player:
                     if not any(NAME_TOKEN.search(line) for result in results for line in result.feed_rows):
                         status += " No confident name-like text. Use Test OCR in Set kill-feed area."
                     elif any(result.feed_mentions or result.feed_lookalikes for result in results) and not any(
@@ -841,6 +861,8 @@ class Desktop:
                             status += " No name on the selected side passed the green check. See OCR readout."
                     elif not self.clips:
                         status += " See OCR readout to check the names and crop."
+                elif not failures and not self.clips:
+                    status += " No on-screen KILL badge was detected."
             elif output is not None:
                 exported = sum(len(result.exports) for result in results)
                 status += f" Exported {exported} to {output}."

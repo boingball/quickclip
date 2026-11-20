@@ -33,6 +33,8 @@ For a large first batch, try mic-only detection and **Find highlights** on a few
 
 ## Make a kill montage
 
+For Battlefield recordings with the boxed **KILL** notification below the score popup, set **Montage cues** to **KILL badge**. QuickClip scans the lower part of the screen for that label, so the player name and kill-feed crop are optional. Choose **Both** to include matches from the label and the kill feed. Overlapping matches merge into one clip.
+
 1. Open a recording or folder, enter your in-game name, and set the seconds before and after each kill. Set **Montage file limit** to `5` for a short trial, or leave it blank to scan the whole folder.
 2. Click **Find montage clips**. QuickClip runs Tesseract only on the kill-feed crop. It looks for the gap between names separately in each row and counts your name on the killer side. It merges overlapping moments from the same recording. Up to four recordings scan concurrently by default, and results appear as each file finishes. Adjust **Montage scan workers** to change how many run at once.
 3. Select a row and click **Play clip** to preview it in FFplay. Click its **Keep** checkbox or press **Space** on the focused row to toggle it. All candidates are checked initially.
@@ -92,5 +94,7 @@ Add `--files 5` to try the first five recordings in filename order. This limits 
 Use `--workers 2` to scan two recordings at a time, or `--workers 1` to scan sequentially.
 
 Use `--show-feed` to show OCR rows and `--feed-region 58,0,42,30` to set the crop as left, top, width, and height percentages. Use `--feed-divider 50` to override per-row detection with a fixed split halfway across the crop. Use `--feed-text-mode colored` to isolate saturated lettering, `--any-feed-mention` for looser matching, and `--montage-audio-fallback` to check loud audio when a recording has no kill matches.
+
+For a badge-only montage, pass `--kill-montage --kill-badge --output "F:\QuickClip-Montage"`. Add `--player boingball` to scan both cues.
 
 If all audio tracks play late in an exported clip, try `--audio-offset-ms -1000` to bring them one second earlier. The desktop app has the same **Export audio offset (ms)** setting. Positive values delay audio. The offset applies to all tracks during export and defaults to zero.
