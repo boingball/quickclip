@@ -44,6 +44,7 @@ class BatchResult:
     feed_right_mentions: int = 0
     feed_unknown_mentions: int = 0
     feed_green_mentions: int | None = None
+    feed_lookalikes: Counter = field(default_factory=Counter)
     feed_matches: int = 0
     feed_uncertain_rows: int = 0
 
@@ -161,6 +162,7 @@ FEED = (.42, .30, .58, .0)
 SCORE = (.44, .38, .28, .34)
 DEFAULT_SCORE = r"\+\s*[0-9]{2,5}\b|\b[0-9]{2,5}\s*XP\b"
 NAME_TOKEN = re.compile(r"(?=[\w.-]*[^\W\d_])[\w.-]{3,32}")
+OCR_LOOKALIKES = ("o0", "il1", "s5", "b8", "z2")
 GREEN_PLAYER = "Green player"
 OCR_MODES = ("Grayscale", "Bright text", "Colored HUD", GREEN_PLAYER)
 OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored", "green"), OCR_MODES))
@@ -222,7 +224,8 @@ class OCRRow:
             hits = [word for start, end, word in spans if start < match.end() and end > match.start()]
             if hits:
                 sides = {self.side(word) for word in hits}
-                yield sides.pop() if len(sides) == 1 else "unknown", all(word.green for word in hits)
+                side = sides.pop() if len(sides) == 1 else "unknown"
+                yield match.group(), side, all(word.green for word in hits)
 
 
 @dataclass(frozen=True)
@@ -293,6 +296,18 @@ def position_feed_rows(rows, fixed_divider):
         words = tuple(sorted(group, key=lambda word: word.left))
         positioned.append(OCRRow(words, find_row_gap(words)))
     return tuple(positioned)
+
+
+def player_name_pattern(player, allow_lookalikes=False):
+    exact = re.escape(player)
+    alternatives = [exact]
+    if allow_lookalikes and len(player) >= 6 and player.isascii() and player.isalnum():
+        for index, char in enumerate(player.lower()):
+            for group in OCR_LOOKALIKES:
+                if char in group:
+                    alternatives.append(exact[:index] + f"[{group}]" + exact[index + 1:])
+                    break
+    return re.compile(r"(?<!\w)(?:" + "|".join(alternatives) + r")(?!\w)", re.IGNORECASE)
 
 
 def ocr_filter(region, mode):
@@ -438,7 +453,8 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
     if player:
         killer_only = feed is not None and not feed.any_mention
         green_only = feed is not None and feed.mode == GREEN_PLAYER
-        player_pattern = re.compile(r"(?<!\w)" + re.escape(player) + r"(?!\w)", re.IGNORECASE)
+        player_pattern = player_name_pattern(player)
+        feed_pattern = player_name_pattern(player, allow_lookalikes=True) if green_only else player_pattern
         divider = (feed_divider_x(recording.frame_size, feed.region, feed.divider)
                    if feed and feed.divider is not None else None)
 
@@ -450,9 +466,16 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
             sides = set()
             green_name = False
             matches = set()
+            lookalikes = set()
+            lookalike_rows = set()
             if feed:
                 for row in rows:
-                    for side, green in row.name_sides(player_pattern):
+                    for spelling, side, green in row.name_sides(feed_pattern):
+                        if not player_pattern.fullmatch(spelling):
+                            if not green:
+                                continue
+                            lookalikes.add(spelling.casefold())
+                            lookalike_rows.add(row.text.casefold())
                         sides.add(side)
                         green_name |= green
                         if (side == "left" or not killer_only) and (green or not green_only):
@@ -461,15 +484,17 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                 matches = mentions
             if diagnostics is not None:
                 diagnostics.feed_mentions += bool(mentions)
+                diagnostics.feed_lookalikes.update(lookalikes)
                 diagnostics.feed_left_mentions += "left" in sides
                 diagnostics.feed_right_mentions += "right" in sides
                 diagnostics.feed_unknown_mentions += "unknown" in sides
                 if green_only:
                     diagnostics.feed_green_mentions = (diagnostics.feed_green_mentions or 0) + green_name
                 diagnostics.feed_matches += bool(matches)
-                readable = {row.text.casefold() for row in rows if row.readable} | mentions
+                relevant = mentions | lookalike_rows
+                readable = {row.text.casefold() for row in rows if row.readable} | relevant
                 diagnostics.feed_uncertain_rows += len(lines - readable)
-                for line in sorted(readable, key=lambda line: line not in mentions):
+                for line in sorted(readable, key=lambda line: line not in relevant):
                     line = line[:160]
                     if len(diagnostics.feed_rows) < 100 or line in diagnostics.feed_rows:
                         diagnostics.feed_rows[line] += 1
@@ -808,12 +833,14 @@ def main():
                                             feed=feed)
             for result in results:
                 if args.show_feed:
-                    print(f"{result.source.name}: player seen in {result.feed_mentions} sample(s), "
+                    print(f"{result.source.name}: exact player name seen in {result.feed_mentions} sample(s), "
                           f"{result.feed_matches} matching current rule.")
                     print(f"  Left side: {result.feed_left_mentions}, right side: {result.feed_right_mentions}, "
                           f"side unknown: {result.feed_unknown_mentions} sample(s).")
                     if result.feed_green_mentions is not None:
                         print(f"  Player name marked green in {result.feed_green_mentions} sample(s).")
+                    for spelling, count in result.feed_lookalikes.most_common():
+                        print(f"  Green OCR look-alike {spelling}: {count} sample(s).")
                     for line, count in result.feed_rows.most_common(12):
                         print(f"  {count:>4}  {line}")
                     if result.feed_uncertain_rows:

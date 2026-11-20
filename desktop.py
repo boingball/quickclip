@@ -619,13 +619,16 @@ class Desktop:
         lines = []
         for result in sorted(self.feed_results, key=lambda result: result.source.name.casefold()):
             lines.append(result.source.name)
-            lines.append(f"Player seen in {result.feed_mentions} sample(s), "
+            lines.append(f"Exact player name seen in {result.feed_mentions} sample(s), "
                          f"{result.feed_matches} matching the selected rule.")
             lines.append(f"Left side · {result.feed_left_mentions} sample(s)   "
                          f"Right side · {result.feed_right_mentions} sample(s)   "
                          f"Side unknown · {result.feed_unknown_mentions} sample(s)")
             if result.feed_green_mentions is not None:
                 lines.append(f"Player name marked green in {result.feed_green_mentions} sample(s).")
+            if result.feed_lookalikes:
+                spellings = ", ".join(f"{value} ({count})" for value, count in result.feed_lookalikes.most_common())
+                lines.append(f"Green OCR look-alikes · {spellings}")
             names = Counter()
             for row, count in result.feed_rows.items():
                 for name in set(NAME_TOKEN.findall(row)):
@@ -704,7 +707,7 @@ class Desktop:
                 if not failures:
                     if not any(NAME_TOKEN.search(line) for result in results for line in result.feed_rows):
                         status += " No confident name-like text. Use Test OCR in Set kill-feed area."
-                    elif any(result.feed_mentions for result in results) and not any(
+                    elif any(result.feed_mentions or result.feed_lookalikes for result in results) and not any(
                             result.feed_matches for result in results):
                         if not feed.any_mention and not any(result.feed_left_mentions for result in results):
                             if any(result.feed_unknown_mentions for result in results):
