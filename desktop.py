@@ -1,6 +1,8 @@
 """Tk desktop interface for QuickClip."""
+from collections import Counter
 from itertools import groupby
 import json
+import math
 import os
 from pathlib import Path
 from queue import Empty, Queue
@@ -12,8 +14,9 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from quickclip import (
-    BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, RECORDING_EXTENSIONS,
-    export_clip, folder_recordings, prepare_output, probe, process_batch, scan_kills, write_montage,
+    BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, KillFeedOptions, NAME_TOKEN,
+    RECORDING_EXTENSIONS, export_clip, folder_recordings, parse_feed_region, prepare_output,
+    probe, process_batch, run, scan_kills, write_montage,
 )
 
 
@@ -44,6 +47,7 @@ class Desktop:
         self.scan_stop = None
         self.completed_files = 0
         self.scan_total = 0
+        self.feed_results = []
         self.kept = set()
         self.messages = Queue()
         self.status = tk.StringVar(value="Open an OBS recording or folder to get started.")
@@ -53,6 +57,9 @@ class Desktop:
         self.score_enabled = tk.BooleanVar()
         self.player = tk.StringVar()
         self.score = tk.StringVar(value=DEFAULT_SCORE)
+        self.feed_region = tk.StringVar(value="58,0,42,30")
+        self.any_feed_mention = tk.BooleanVar()
+        self.audio_fallback = tk.BooleanVar()
 
         root.title("QuickClip")
         root.minsize(720, 460)
@@ -111,6 +118,12 @@ class Desktop:
         self.montage_button = ttk.Button(settings, text="Find montage clips",
                                          command=lambda: self.start_scan(montage=True))
         self.montage_button.grid(row=5, column=3, sticky="e", pady=(4, 0))
+        self.crop_button = ttk.Button(settings, text="Set kill-feed area…", command=self.configure_feed)
+        self.crop_button.grid(row=6, column=3, sticky="e", pady=(4, 0))
+        ttk.Checkbutton(settings, text="Match name anywhere in feed", variable=self.any_feed_mention).grid(
+            row=7, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(settings, text="Use loud audio if no kill matches", variable=self.audio_fallback).grid(
+            row=7, column=2, columnspan=2, sticky="w")
 
         results = ttk.Frame(body)
         results.pack(fill="both", expand=True)
@@ -135,6 +148,8 @@ class Desktop:
         actions.pack(fill="x", pady=(10, 0))
         self.preview_button = ttk.Button(actions, text="Play clip", command=self.preview)
         self.preview_button.pack(side="left")
+        self.feed_button = ttk.Button(actions, text="OCR readout", command=self.show_feed_results)
+        self.feed_button.pack(side="left", padx=(6, 0))
         ttk.Label(actions, textvariable=self.keep_count).pack(side="left", padx=10)
         self.export_button = ttk.Button(actions, text="Export selected…", command=self.export)
         self.export_button.pack(side="right")
@@ -170,10 +185,12 @@ class Desktop:
             if isinstance(values.get(key), str):
                 field.delete(0, "end")
                 field.insert(0, values[key])
-        for key, field in (("player", self.player), ("score", self.score)):
+        for key, field in (("player", self.player), ("score", self.score), ("feed_region", self.feed_region)):
             if isinstance(values.get(key), str):
                 field.set(values[key])
         self.score_enabled.set(values.get("score_enabled") is True)
+        self.any_feed_mention.set(values.get("any_feed_mention") is True)
+        self.audio_fallback.set(values.get("audio_fallback") is True)
         if isinstance(values.get("output"), str) and values["output"]:
             self.output = Path(values["output"])
             self.show_output()
@@ -185,7 +202,8 @@ class Desktop:
         values.update(input=str(self.input_path) if self.input_path else "",
                       output=str(self.output) if self.output else "",
                       track=self.track.get(), player=self.player.get(), score=self.score.get(),
-                      score_enabled=self.score_enabled.get())
+                      score_enabled=self.score_enabled.get(), feed_region=self.feed_region.get(),
+                      any_feed_mention=self.any_feed_mention.get(), audio_fallback=self.audio_fallback.get())
         temp = None
         try:
             self.settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -216,8 +234,9 @@ class Desktop:
         can_preview = bool(self.table.selection()) and (not self.busy or self.montage_scanning)
         for button in (self.open_button, self.folder_button, self.output_button):
             button.configure(state="disabled" if self.busy else "normal")
-        for button in (self.scan_button, self.batch_button, self.montage_button):
+        for button in (self.scan_button, self.batch_button, self.montage_button, self.crop_button):
             button.configure(state="normal" if self.sources and not self.busy else "disabled")
+        self.feed_button.configure(state="normal" if self.feed_results else "disabled")
         self.export_button.configure(state="normal" if ready else "disabled")
         self.build_button.configure(state="normal" if self.kept and not self.busy else "disabled")
         self.preview_button.configure(state="normal" if can_preview and shutil.which("ffplay") else "disabled")
@@ -243,6 +262,7 @@ class Desktop:
                     continue
                 if kind == "montage_result":
                     self.completed_files += 1
+                    self.feed_results.append(value)
                     self.append_candidates(value)
                     self.update_keep_count()
                     self.buttons()
@@ -265,6 +285,7 @@ class Desktop:
 
     def clear(self, montage=False):
         self.clips = []
+        self.feed_results.clear()
         self.kept.clear()
         self.montage_review = montage
         self.keep_count.set("")
@@ -392,12 +413,138 @@ class Desktop:
             return self.output
         return None
 
+    def configure_feed(self):
+        selected = self.table.selection()
+        source, start = self.sources[0], 0
+        if selected:
+            source, clip = self.clips[int(selected[0])]
+            start = (clip.start + clip.end) / 2
+        window = tk.Toplevel(self.root)
+        window.title("Set kill-feed area")
+        frame = ttk.Frame(window, padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text=source.name).pack(anchor="w")
+        tools = ttk.Frame(frame)
+        tools.pack(fill="x", pady=6)
+        ttk.Label(tools, text="Frame time (seconds)").pack(side="left")
+        timestamp = ttk.Entry(tools, width=8)
+        timestamp.insert(0, f"{start:.1f}")
+        timestamp.pack(side="left", padx=6)
+        canvas = tk.Canvas(frame, width=640, height=360, highlightthickness=0, background="black")
+        canvas.pack()
+        ttk.Label(frame, text="Load a frame with a visible kill feed and drag a box around it.").pack(anchor="w")
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x", pady=(8, 0))
+        ttk.Label(controls, text="Left, top, width, height (%)").pack(side="left")
+        crop = tk.StringVar(frame, value=self.feed_region.get())
+        entry = ttk.Entry(controls, textvariable=crop, width=24)
+        entry.pack(side="left", padx=6)
+        origin = None
+        photo = None
+
+        def outline():
+            canvas.delete("crop")
+            if photo is not None:
+                try:
+                    width, height, left, top = parse_feed_region(crop.get())
+                except ValueError:
+                    return
+                canvas.create_rectangle(left * photo.width(), top * photo.height(),
+                                        (left + width) * photo.width(), (top + height) * photo.height(),
+                                        outline="#ffe15c", width=2, tags="crop")
+
+        def read_frame():
+            try:
+                seconds = float(timestamp.get())
+                if not math.isfinite(seconds) or seconds < 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("QuickClip", "Enter a nonnegative frame time.", parent=window)
+                return
+            if self.busy:
+                return
+            self.status.set("Loading kill-feed preview frame…")
+
+            def complete(data):
+                nonlocal photo
+                if not window.winfo_exists():
+                    return
+                if not data:
+                    self.status.set("No image at that time. Try an earlier frame.")
+                    return
+                photo = tk.PhotoImage(master=window, data=data, format="PPM")
+                canvas.configure(width=photo.width(), height=photo.height())
+                canvas.delete("all")
+                canvas.create_image(0, 0, image=photo, anchor="nw")
+                outline()
+                self.status.set("Kill-feed preview loaded.")
+
+            self.work(lambda: run(["ffmpeg", "-v", "error", "-ss", f"{seconds:.3f}",
+                                   "-i", str(source), "-map", "0:V:0", "-frames:v", "1",
+                                   "-vf", "scale=760:420:force_original_aspect_ratio=decrease",
+                                   "-c:v", "ppm", "-f", "image2pipe", "pipe:1"]), complete)
+
+        def begin(event):
+            nonlocal origin
+            if photo is not None:
+                origin = event.x, event.y
+
+        def drag(event):
+            if origin is None:
+                return
+            left, right = sorted(round(100 * min(max(x, 0), photo.width()) / photo.width(), 1)
+                                 for x in (origin[0], event.x))
+            top, bottom = sorted(round(100 * min(max(y, 0), photo.height()) / photo.height(), 1)
+                                 for y in (origin[1], event.y))
+            if right - left >= 1 and bottom - top >= 1:
+                crop.set(f"{left:g},{top:g},{right - left:.1f},{bottom - top:.1f}")
+
+        def save():
+            try:
+                parse_feed_region(crop.get())
+            except ValueError as error:
+                messagebox.showerror("QuickClip", str(error), parent=window)
+                return
+            self.feed_region.set(crop.get())
+            self.save_settings()
+            window.destroy()
+
+        crop.trace_add("write", lambda *_: outline())
+        canvas.bind("<Button-1>", begin)
+        canvas.bind("<B1-Motion>", drag)
+        canvas.bind("<ButtonRelease-1>", drag)
+        ttk.Button(tools, text="Load frame", command=read_frame).pack(side="left")
+        ttk.Button(controls, text="Reset top-right crop", command=lambda: crop.set("58,0,42,30")).pack(side="left")
+        ttk.Button(controls, text="Save area", command=save).pack(side="right", padx=(8, 0))
+        read_frame()
+
+    def show_feed_results(self):
+        lines = []
+        for result in sorted(self.feed_results, key=lambda result: result.source.name.casefold()):
+            lines.append(result.source.name)
+            lines.append(f"Player seen in {result.feed_mentions} sample(s), "
+                         f"{result.feed_matches} matching the selected rule.")
+            names = Counter()
+            for row, count in result.feed_rows.items():
+                for name in set(NAME_TOKEN.findall(row)):
+                    names[name] += count
+            if names:
+                names_list = ", ".join(name for name, _ in names.most_common(12))
+                lines.append(f"Possible names and words · {names_list}")
+                lines.extend(f"  {count} × {line}" for line, count in result.feed_rows.most_common(12))
+            else:
+                lines.append("No name-like text. Check Set kill-feed area on a frame with a visible feed.")
+            lines.append("")
+        self.show_details("Kill-feed OCR readout", "\n".join(lines))
+
     def start_scan(self, auto_export=False, montage=False):
         player = self.player.get().strip()
         sources = self.sources
         try:
             before, after = float(self.before.get()), float(self.after.get())
             audio_offset = self.read_audio_offset() if auto_export else 0
+            selection = self.track.current()
+            track = "auto" if selection == 0 else selection - 1
             if montage:
                 if not player:
                     raise ValueError("Enter your player name to make a kill montage.")
@@ -410,9 +557,11 @@ class Desktop:
                 if not workers.isascii() or not workers.isdecimal() or int(workers) < 1:
                     raise ValueError("Enter a positive whole number for the montage scan workers.")
                 workers = int(workers)
+                fallback = (track or "auto") if self.audio_fallback.get() else 0
+                threshold = float(self.threshold.get()) if fallback else -18
+                feed = KillFeedOptions(parse_feed_region(self.feed_region.get()),
+                                       self.any_feed_mention.get(), fallback, threshold)
             else:
-                selection = self.track.current()
-                track = "auto" if selection == 0 else selection - 1
                 score = self.score.get().strip() if self.score_enabled.get() else ""
                 if self.score_enabled.get() and not score:
                     raise ValueError("Enter a score text pattern.")
@@ -446,8 +595,14 @@ class Desktop:
             if montage:
                 if self.clips:
                     status += " Play clips and untick any you want to leave out."
-                elif not failures:
-                    status += " Try a recording where your name is visible in the kill feed."
+                if not failures:
+                    if not any(NAME_TOKEN.search(line) for result in results for line in result.feed_rows):
+                        status += " No name-like text. Use Set kill-feed area on a frame with the feed visible."
+                    elif any(result.feed_mentions for result in results) and not any(
+                            result.feed_matches for result in results):
+                        status += " OCR saw your name but found no matching kill row. See OCR readout."
+                    elif not self.clips:
+                        status += " See OCR readout to check the names and crop."
             elif output is not None:
                 exported = sum(len(result.exports) for result in results)
                 status += f" Exported {exported} to {output}."
@@ -464,7 +619,7 @@ class Desktop:
             if montage:
                 results = []
                 for result in scan_kills(sources, player, before, after, progress,
-                                         workers=workers, stop=self.scan_stop):
+                                         workers=workers, stop=self.scan_stop, feed=feed):
                     results.append(result)
                     self.messages.put(("montage_result", result))
                 return results
@@ -518,15 +673,18 @@ class Desktop:
         self.work(operation, complete)
 
     def show_failures(self, failures):
+        details = "\n\n".join(f"{source.name}\n" + "\n".join(errors) for source, errors in failures)
+        self.show_details("Recording errors", details)
+
+    def show_details(self, title, details):
         window = tk.Toplevel(self.root)
-        window.title("Recording errors")
+        window.title(title)
         detail = tk.Text(window, width=85, height=16, wrap="word")
         scrollbar = ttk.Scrollbar(window, command=detail.yview)
         detail.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         detail.pack(side="left", fill="both", expand=True)
-        for source, errors in failures:
-            detail.insert("end", f"{source.name}\n" + "\n".join(errors) + "\n\n")
+        detail.insert("end", details)
         detail.configure(state="disabled")
 
     def preview(self):

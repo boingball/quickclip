@@ -1,10 +1,10 @@
 """Find and export highlights from local OBS recordings."""
 import argparse
 from array import array
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import closing
-from dataclasses import dataclass
+from contextlib import closing, nullcontext
+from dataclasses import dataclass, field
 import json
 import math
 import os
@@ -36,6 +36,9 @@ class BatchResult:
     clips: list[Clip]
     exports: list[Path]
     errors: list[str]
+    feed_rows: Counter = field(default_factory=Counter)
+    feed_mentions: int = 0
+    feed_matches: int = 0
 
 
 RECORDING_EXTENSIONS = (".mkv", ".mp4", ".mov", ".ts", ".flv", ".webm")
@@ -131,9 +134,11 @@ def detect_mic_track(path, recording, progress):
     raise ValueError(f"{detail}. Play the audio tracks to identify yours, then select it manually.")
 
 
-def microphone_events(levels, threshold, duration, reason, progress):
+def microphone_events(levels, threshold, duration, reason, progress, *, stop=None):
     cutoff = 10 ** (threshold / 10)
     for index, level in enumerate(levels):
+        if stop is not None and stop.is_set():
+            return
         if index % 300 == 0:
             progress(f"Scanning microphone at {index / 10:.0f} / {duration:.0f}s")
         if level >= cutoff:
@@ -144,11 +149,31 @@ def microphone_events(levels, threshold, duration, reason, progress):
 FEED = (.42, .30, .58, .0)
 SCORE = (.44, .38, .28, .34)
 DEFAULT_SCORE = r"\+\s*[0-9]{2,5}\b|\b[0-9]{2,5}\s*XP\b"
+NAME_TOKEN = re.compile(r"(?=[\w.-]*[^\W\d_])[\w.-]{3,32}")
+
+
+@dataclass(frozen=True)
+class KillFeedOptions:
+    region: tuple[float, float, float, float] = FEED
+    any_mention: bool = False
+    fallback_track: int | str = 0
+    threshold: float = -18
+
+
+def parse_feed_region(text):
+    try:
+        left, top, width, height = (float(part) / 100 for part in text.split(","))
+    except ValueError as error:
+        raise ValueError("Enter crop percentages as left, top, width, height.") from error
+    if not (0 <= left <= .99 and 0 <= top <= .99 and .01 <= width <= 1 and .01 <= height <= 1
+            and left + width <= 1.0000001 and top + height <= 1.0000001):
+        raise ValueError("Keep the crop within the frame and at least 1% wide and tall.")
+    return width, height, left, top
 
 
 def ocr_events(path, region, reason, identify, duration, progress, *, page_mode="11", stop=None):
     width, height, left, top = region
-    filters = (f"fps=2:start_time=0,crop=iw*{width}:ih*{height}:iw*{left}:ih*{top},"
+    filters = (f"fps=2:start_time=0,crop=iw*{width}:ih*{height}:iw*{left}:ih*{top}:exact=1,"
                "scale=768:384,format=gray")
     command = decode(path, "-filter_threads", "1", "-threads:v", "1")
     command += ["-map", "0:V:0", "-an", "-vf", filters, "-threads:v", "1",
@@ -207,7 +232,7 @@ def validate_detection(track, threshold, player, score, before, after):
 
 
 def scan(path, recording, track, threshold, player, score, before, after, progress=print,
-         *, killer_only=False, stop=None):
+         *, feed=None, diagnostics=None, stop=None):
     player, score_pattern = validate_detection(track, threshold, player, score, before, after)
     levels = None
     auto = track == "auto"
@@ -228,18 +253,29 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         reason = f"Mic peak (track {track})" if auto else "Mic peak"
         events.extend(microphone_events(levels, threshold, recording.duration, reason, progress))
     if player:
+        killer_only = feed is not None and not feed.any_mention
         player_pattern = re.compile(r"(?<!\w)" + re.escape(player) + r"(?!\w)", re.IGNORECASE)
         killer_pattern = re.compile(r"^\s*(?:\[[^\]]+\]\s*)?" + player_pattern.pattern,
                                     re.IGNORECASE)
 
         def feed_matches(text):
+            lines = {" ".join(line.casefold().split()) for line in text.splitlines() if line.strip()}
+            mentions = {line for line in lines if player_pattern.search(line)}
             if killer_only:
-                return {" ".join(line.casefold().split()) for line in text.splitlines()
-                        if (match := killer_pattern.match(line)) and re.search(r"\w", line[match.end():])}
-            return {" ".join(line.casefold().split()) for line in text.splitlines()
-                    if player_pattern.search(line)}
+                matches = {line for line in mentions if (match := killer_pattern.match(line))
+                           and re.search(r"\w", line[match.end():])}
+            else:
+                matches = mentions
+            if diagnostics is not None:
+                diagnostics.feed_mentions += bool(mentions)
+                diagnostics.feed_matches += bool(matches)
+                for line in sorted(lines, key=lambda line: line not in mentions):
+                    line = line[:160]
+                    if len(diagnostics.feed_rows) < 100 or line in diagnostics.feed_rows:
+                        diagnostics.feed_rows[line] += 1
+            return matches
 
-        events.extend(ocr_events(path, FEED, "Kill feed", feed_matches,
+        events.extend(ocr_events(path, feed.region if feed else FEED, "Kill feed", feed_matches,
                                  recording.duration, progress, page_mode="6" if killer_only else "11",
                                  stop=stop))
     if score_pattern:
@@ -249,6 +285,26 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         events.extend(ocr_events(path, SCORE, "Score popup", score_matches,
                                  recording.duration, progress))
     return find_clips(events, recording.duration, before, after)
+
+
+def loud_fallback(source, recording, feed, before, after, progress, stop):
+    if not recording.audio or (stop is not None and stop.is_set()):
+        return []
+    track, levels = feed.fallback_track, None
+    if track == "auto" and len(recording.audio) > 1:
+        try:
+            track, levels = detect_mic_track(source, recording, progress)
+        except ValueError:
+            track = 1
+    if track == "auto" or track > len(recording.audio):
+        track = 1
+    progress(f"No kill match. Searching for loud audio on track {track}.")
+    if levels is None:
+        levels = audio_levels(source, track)
+    with closing(levels) if hasattr(levels, "close") else nullcontext(levels) as samples:
+        return find_clips(microphone_events(samples, feed.threshold, recording.duration,
+                                            f"Loud audio (track {track})", progress, stop=stop),
+                          recording.duration, before, after)
 
 
 def export_clip(source, clip, directory, progress=print, *, audio_offset_ms=0):
@@ -324,14 +380,17 @@ def validate_batch(options):
             raise RuntimeError(f"Install {program} and add it to PATH.")
 
 
-def scan_recording(source, options, progress, *, killer_only=False, stop=None):
+def scan_recording(source, options, progress, *, feed=None, stop=None):
     result = BatchResult(source, [], [], [])
     if stop is not None and stop.is_set():
         return result
     progress("Reading recording")
     try:
-        result.clips = scan(source, probe(source), *options, progress=progress,
-                            killer_only=killer_only, stop=stop)
+        recording = probe(source)
+        result.clips = scan(source, recording, *options, progress=progress, feed=feed,
+                            diagnostics=result if feed else None, stop=stop)
+        if feed and feed.fallback_track and not result.clips:
+            result.clips = loud_fallback(source, recording, feed, *options[-2:], progress, stop)
     except (OSError, RuntimeError, ValueError) as error:
         result.errors.append(str(error))
     return result
@@ -367,18 +426,48 @@ def export_candidates(result, output, progress, audio_offset_ms):
 def montage_layout(path):
     info = json.loads(run(["ffprobe", "-v", "error", "-show_entries",
                            "stream=codec_type,codec_name,time_base,width,height,pix_fmt,sample_aspect_ratio,"
-                           "channels,channel_layout,sample_rate:stream_tags=title,language",
+                           "channels,channel_layout,sample_rate,sample_fmt:stream_tags=title,language",
                            "-of", "json", str(path)]))
     return info["streams"]
 
 
+def compatible_montage_layout(layout, expected):
+    if layout == expected[:len(layout)]:
+        return True
+    if len(layout) != 2 or len(expected) <= 2 or layout[0] != expected[0]:
+        return False
+    # A single legacy audio track occupies the main audio slot even if its title differs.
+    return ({key: value for key, value in layout[1].items() if key != "tags"}
+            == {key: value for key, value in expected[1].items() if key != "tags"})
+
+
+def pad_montage_audio(path, present, expected):
+    missing = expected[len(present):]
+    if not missing:
+        return
+    duration = probe(path).duration
+    padded = path.with_name("padded-" + path.name)
+    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path)]
+    for stream in missing:
+        layout = stream.get("channel_layout") or f'{stream["channels"]}c'
+        command += ["-f", "lavfi", "-i", f'anullsrc=r={stream["sample_rate"]}:cl={layout}']
+    command += ["-t", f"{duration:.3f}", "-map", "0", "-c", "copy"]
+    for input_index, stream in enumerate(missing, 1):
+        index = len(present) + input_index - 2
+        command += ["-map", f"{input_index}:a:0", f"-c:a:{index}", "flac"]
+        if stream.get("sample_fmt"):
+            command += [f"-sample_fmt:a:{index}", stream["sample_fmt"]]
+    run(command + [str(padded)])
+    padded.replace(path)
+
+
 def scan_kills(sources, player, before, after, progress=print, *,
-               workers=DEFAULT_MONTAGE_WORKERS, stop=None):
+               workers=DEFAULT_MONTAGE_WORKERS, stop=None, feed=KillFeedOptions()):
     if not player.strip():
         raise ValueError("Enter your player name to make a kill montage.")
     if workers < 1:
         raise ValueError("Choose at least one montage scan worker.")
-    options = (0, -18, player, "", before, after)
+    options = (0, feed.threshold, player, "", before, after)
     validate_batch(options)
     if not sources:
         return
@@ -389,7 +478,7 @@ def scan_kills(sources, player, before, after, progress=print, *,
         def report(message):
             progress(f"[{index}/{len(sources)}] {source.name} · {message}")
 
-        return scan_recording(source, options, report, killer_only=True, stop=stop)
+        return scan_recording(source, options, report, feed=feed, stop=stop)
 
     pool = ThreadPoolExecutor(max_workers=min(workers, len(sources)))
     try:
@@ -410,35 +499,42 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
         staging = Path(temp)
         results = []
         segments = []
-        layout = None
         for result in candidates:
             results.append(result)
             if result.clips:
                 progress(f"{result.source.name} · Preparing montage clips")
                 export_candidates(result, staging, progress, audio_offset_ms)
             for clip_index, segment in enumerate(result.exports):
-                current = montage_layout(segment)
-                if layout is not None and current != layout:
-                    raise ValueError(f"{result.source.name} has a different video or audio track layout. "
-                                     "Build separate montages for recordings with matching settings.")
-                layout = current
+                layout = montage_layout(segment)
                 name = f"segment-{len(segments):06d}.mkv"
                 segment.replace(staging / name)
-                segments.append((source_order[result.source], clip_index, f"file '{name}'\n"))
+                segments.append((source_order[result.source], clip_index, name, layout))
         if not segments:
             return results, None
         progress(f"Joining {len(segments)} highlight segment(s)…")
+        expected = max((layout for _, _, _, layout in segments), key=len)
+        for source_index, _, name, layout in segments:
+            if not compatible_montage_layout(layout, expected):
+                raise ValueError(f"{sources[source_index].name} has a different video or audio layout. "
+                                 "Build separate montages for recordings with matching settings.")
+            pad_montage_audio(staging / name, layout, expected)
         manifest = staging / "segments.txt"
-        manifest.write_text("".join(line for _, _, line in sorted(segments)), encoding="ascii")
+        manifest.write_text("".join(f"file '{name}'\n" for _, _, name, _ in sorted(segments)), encoding="ascii")
         encoded = staging / "montage.mkv"
-        run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-             "-f", "concat", "-i", str(manifest), "-map", "0", "-c", "copy", str(encoded)])
+        command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                   "-f", "concat", "-i", str(manifest), "-map", "0", "-c", "copy"]
+        for index, stream in enumerate(expected[1:]):
+            tags = stream.get("tags", {})
+            for key in ("title", "language"):
+                command += [f"-metadata:s:a:{index}", f"{key}={tags.get(key, '')}"]
+        run(command + [str(encoded)])
         return results, publish_export(encoded, output, "kill-montage")
 
 
 def kill_montage(sources, player, before, after, output, progress=print, *,
-                 audio_offset_ms=0, workers=DEFAULT_MONTAGE_WORKERS):
-    with closing(scan_kills(sources, player, before, after, progress, workers=workers)) as candidates:
+                 audio_offset_ms=0, workers=DEFAULT_MONTAGE_WORKERS, feed=KillFeedOptions()):
+    with closing(scan_kills(sources, player, before, after, progress, workers=workers,
+                            feed=feed)) as candidates:
         return write_montage(sources, candidates, output, progress, audio_offset_ms=audio_offset_ms)
 
 
@@ -469,6 +565,14 @@ def main():
                         help="Join kill-feed matches into one MKV. Requires --player and --output.")
     parser.add_argument("--workers", type=int, default=DEFAULT_MONTAGE_WORKERS,
                         help=f"Recordings to scan at once in montage mode (default {DEFAULT_MONTAGE_WORKERS}).")
+    parser.add_argument("--feed-region", default="58,0,42,30", metavar="L,T,W,H",
+                        help="Montage kill-feed crop as percentages of the full frame.")
+    parser.add_argument("--any-feed-mention", action="store_true",
+                        help="Include any OCR line mentioning the player in a montage, including deaths.")
+    parser.add_argument("--montage-audio-fallback", action="store_true",
+                        help="Find loud audio in recordings with no kill-feed matches.")
+    parser.add_argument("--show-feed", action="store_true",
+                        help="Print the most common OCR rows from each montage recording.")
     parser.add_argument("--audio-offset-ms", type=int, default=0,
                         help="Shift all exported audio tracks. Negative brings audio earlier; positive delays it.")
     args = parser.parse_args()
@@ -488,9 +592,21 @@ def main():
         if args.kill_montage:
             if args.output is None:
                 raise ValueError("--kill-montage requires an output folder.")
+            fallback_track = (args.mic_track if args.mic_track else "auto") if args.montage_audio_fallback else 0
+            validate_detection(fallback_track, args.threshold, args.player, "", before, after)
+            feed = KillFeedOptions(parse_feed_region(args.feed_region), args.any_feed_mention,
+                                   fallback_track, args.threshold)
             results, montage = kill_montage(sources, args.player, before, after, args.output,
-                                            audio_offset_ms=args.audio_offset_ms, workers=args.workers)
+                                            audio_offset_ms=args.audio_offset_ms, workers=args.workers,
+                                            feed=feed)
             for result in results:
+                if args.show_feed:
+                    print(f"{result.source.name}: player seen in {result.feed_mentions} sample(s), "
+                          f"{result.feed_matches} matching current rule.")
+                    for line, count in result.feed_rows.most_common(12):
+                        print(f"  {count:>4}  {line}")
+                    if not any(NAME_TOKEN.search(line) for line in result.feed_rows):
+                        print("  No name-like text. Check --feed-region on footage with a visible kill feed.")
                 for error in result.errors:
                     print(f"{result.source.name}: {error}", file=sys.stderr)
             print(f"Montage: {montage}" if montage else "No kill montage was created.")
