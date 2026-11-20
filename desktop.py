@@ -1,4 +1,5 @@
 """Tk desktop interface for QuickClip."""
+from itertools import groupby
 from pathlib import Path
 from queue import Empty, Queue
 import shutil
@@ -8,8 +9,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from quickclip import (
-    DEFAULT_SCORE, RECORDING_EXTENSIONS, export_clip, folder_recordings, kill_montage,
-    prepare_output, probe, process_batch,
+    BatchResult, DEFAULT_SCORE, RECORDING_EXTENSIONS, export_clip, folder_recordings,
+    prepare_output, probe, process_batch, scan_kills, write_montage,
 )
 
 
@@ -26,10 +27,13 @@ class Desktop:
         self.default_output = None
         self.output = None
         self.clips = []
+        self.montage_review = False
+        self.kept = set()
         self.messages = Queue()
         self.status = tk.StringVar(value="Open an OBS recording or folder to get started.")
         self.filename = tk.StringVar(value="No input selected")
         self.output_name = tk.StringVar(value="No output folder selected")
+        self.keep_count = tk.StringVar()
         self.score_enabled = tk.BooleanVar()
         self.player = tk.StringVar()
         self.score = tk.StringVar(value=DEFAULT_SCORE)
@@ -62,6 +66,7 @@ class Desktop:
         self.after = ttk.Entry(settings, width=8)
         self.audio_offset = ttk.Entry(settings, width=8)
         self.audio_offset.insert(0, "0")
+        self.montage_limit = ttk.Entry(settings, width=8)
         for field, value in ((self.threshold, "-18"), (self.before, "10"), (self.after, "6")):
             field.insert(0, value)
         settings_fields = (
@@ -72,6 +77,7 @@ class Desktop:
             ("Score text pattern", ttk.Entry(settings, textvariable=self.score), 2, 0),
             ("Seconds after", self.after, 2, 2),
             ("Export audio offset (ms)", self.audio_offset, 4, 0),
+            ("Montage file limit (optional)", self.montage_limit, 5, 0),
         )
         for label, field, row, column in settings_fields:
             ttk.Label(settings, text=label).grid(row=row, column=column, sticky="w", padx=(0, 8))
@@ -83,13 +89,16 @@ class Desktop:
         self.batch_button = ttk.Button(settings, text="Scan and export all",
                                        command=lambda: self.start_scan(auto_export=True))
         self.batch_button.grid(row=4, column=3, sticky="e", pady=(4, 0))
-        self.montage_button = ttk.Button(settings, text="Make kill montage",
+        self.montage_button = ttk.Button(settings, text="Find montage clips",
                                          command=lambda: self.start_scan(montage=True))
         self.montage_button.grid(row=5, column=3, sticky="e", pady=(4, 0))
 
         results = ttk.Frame(body)
         results.pack(fill="both", expand=True)
-        self.table = ttk.Treeview(results, columns=("source", "start", "end", "reasons"), show="headings")
+        self.table = ttk.Treeview(results, columns=("keep", "source", "start", "end", "reasons"),
+                                  displaycolumns=("source", "start", "end", "reasons"), show="headings")
+        self.table.heading("keep", text="Keep")
+        self.table.column("keep", width=58, anchor="center", stretch=False)
         for name, title, width in (("source", "Recording", 250), ("start", "Start", 100),
                                    ("end", "End", 100), ("reasons", "Detected by", 210)):
             self.table.heading(name, text=title)
@@ -99,14 +108,18 @@ class Desktop:
         scrollbar.pack(side="right", fill="y")
         self.table.pack(side="left", fill="both", expand=True)
         self.table.bind("<<TreeviewSelect>>", lambda _: self.buttons())
-        self.table.bind("<Double-1>", lambda _: self.preview())
+        self.table.bind("<Button-1>", self.click_keep)
+        self.table.bind("<Double-1>", self.double_click)
+        self.table.bind("<space>", self.toggle_focused)
 
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(10, 0))
-        self.preview_button = ttk.Button(actions, text="Preview", command=self.preview)
+        self.preview_button = ttk.Button(actions, text="Play clip", command=self.preview)
         self.preview_button.pack(side="left")
+        ttk.Label(actions, textvariable=self.keep_count).pack(side="left", padx=10)
         self.export_button = ttk.Button(actions, text="Export selected…", command=self.export)
         self.export_button.pack(side="right")
+        self.build_button = ttk.Button(actions, text="Build montage", command=self.build_montage)
         ttk.Label(body, textvariable=self.status, wraplength=680).pack(fill="x", pady=(10, 0))
 
         self.busy = False
@@ -120,6 +133,7 @@ class Desktop:
         for button in (self.scan_button, self.batch_button, self.montage_button):
             button.configure(state="normal" if self.sources and not self.busy else "disabled")
         self.export_button.configure(state="normal" if ready else "disabled")
+        self.build_button.configure(state="normal" if self.kept and not self.busy else "disabled")
         self.preview_button.configure(state="normal" if ready and shutil.which("ffplay") else "disabled")
 
     def work(self, operation, complete):
@@ -153,9 +167,56 @@ class Desktop:
             pass
         self.root.after(100, self.poll)
 
-    def clear(self):
+    def clear(self, montage=False):
         self.clips = []
+        self.kept.clear()
+        self.montage_review = montage
+        self.keep_count.set("")
         self.table.delete(*self.table.get_children())
+        if montage:
+            self.table.configure(displaycolumns=("keep", "source", "start", "end", "reasons"))
+            self.export_button.pack_forget()
+            self.build_button.pack(side="right")
+        else:
+            self.table.configure(displaycolumns=("source", "start", "end", "reasons"))
+            self.build_button.pack_forget()
+            self.export_button.pack(side="right")
+
+    def click_keep(self, event):
+        if self.montage_review and self.table.identify_column(event.x) == "#1":
+            row = self.table.identify_row(event.y)
+            if row:
+                self.table.focus(row)
+                self.table.selection_set(row)
+                self.table.focus_set()
+                self.toggle_keep(row)
+                return "break"
+
+    def double_click(self, event):
+        if self.table.identify_row(event.y):
+            if self.montage_review and self.table.identify_column(event.x) == "#1":
+                return "break"
+            self.preview()
+
+    def toggle_focused(self, _):
+        if self.montage_review and (row := self.table.focus()):
+            self.toggle_keep(row)
+            return "break"
+
+    def toggle_keep(self, row):
+        if self.busy:
+            return
+        index = int(row)
+        if index in self.kept:
+            self.kept.remove(index)
+        else:
+            self.kept.add(index)
+        self.table.set(row, "keep", "☑" if index in self.kept else "☐")
+        self.update_keep_count()
+        self.buttons()
+
+    def update_keep_count(self):
+        self.keep_count.set(f"{len(self.kept)} of {len(self.clips)} clips kept")
 
     def open(self):
         filters = " ".join(f"*{ext}" for ext in RECORDING_EXTENSIONS)
@@ -219,12 +280,18 @@ class Desktop:
 
     def start_scan(self, auto_export=False, montage=False):
         player = self.player.get().strip()
+        sources = self.sources
         try:
             before, after = float(self.before.get()), float(self.after.get())
-            audio_offset = self.read_audio_offset() if auto_export or montage else 0
+            audio_offset = self.read_audio_offset() if auto_export else 0
             if montage:
                 if not player:
                     raise ValueError("Enter your player name to make a kill montage.")
+                limit = self.montage_limit.get().strip()
+                if limit:
+                    if not limit.isascii() or not limit.isdecimal() or int(limit) < 1:
+                        raise ValueError("Enter a positive whole number for the montage file limit.")
+                    sources = sources[:int(limit)]
             else:
                 selection = self.track.current()
                 track = "auto" if selection == 0 else selection - 1
@@ -237,14 +304,13 @@ class Desktop:
             return
 
         output = None
-        if auto_export or montage:
+        if auto_export:
             output = self.output or self.default_output or self.choose_output()
             if output is None:
                 return
 
-        def complete(value):
-            results, montage_path = value
-            self.clear()
+        def complete(results):
+            self.clear(montage=montage)
             exported = 0
             failures = []
             for result in results:
@@ -255,11 +321,16 @@ class Desktop:
                     index = len(self.clips)
                     self.clips.append((result.source, clip))
                     self.table.insert("", "end", iid=str(index), values=(
-                        result.source.name, clock(clip.start), clock(clip.end),
+                        "☑" if montage else "", result.source.name, clock(clip.start), clock(clip.end),
                         ", ".join(clip.reasons)))
             status = f"Checked {len(results)} recording(s). Found {len(self.clips)} candidate(s)."
             if montage:
-                status += f" Saved {montage_path}." if montage_path else " No montage was created."
+                self.kept.update(range(len(self.clips)))
+                self.update_keep_count()
+                if self.clips:
+                    self.table.selection_set("0")
+                    self.table.focus("0")
+                    status += " Play clips and untick any you want to leave out."
             elif output is not None:
                 status += f" Exported {exported} to {output}."
             if failures:
@@ -273,13 +344,39 @@ class Desktop:
 
         def operation():
             if montage:
-                return kill_montage(self.sources, player, before, after, output, progress,
-                                    audio_offset_ms=audio_offset)
-            results = list(process_batch(self.sources, options, output, progress,
-                                         audio_offset_ms=audio_offset))
-            return results, None
+                return list(scan_kills(sources, player, before, after, progress))
+            return list(process_batch(sources, options, output, progress, audio_offset_ms=audio_offset))
 
         self.status.set("Scanning recordings…")
+        self.work(operation, complete)
+
+    def build_montage(self):
+        try:
+            audio_offset = self.read_audio_offset()
+        except ValueError as error:
+            messagebox.showerror("QuickClip", str(error))
+            return
+        directory = self.output or self.default_output or self.choose_output()
+        if directory is None:
+            return
+        clips = [self.clips[index] for index in sorted(self.kept)]
+        candidates = [BatchResult(source, [clip for _, clip in group], [], [])
+                      for source, group in groupby(clips, key=lambda item: item[0])]
+
+        def operation():
+            return write_montage(self.sources, candidates, directory,
+                                  lambda msg: self.messages.put(("progress", msg)),
+                                  audio_offset_ms=audio_offset)
+
+        def complete(value):
+            results, path = value
+            failures = [(result.source, result.errors) for result in results if result.errors]
+            count = sum(len(result.exports) for result in results)
+            self.status.set(f"Saved {count} clip(s) to {path}." if path else "No montage was created.")
+            if failures:
+                self.show_failures(failures)
+
+        self.status.set("Building montage…")
         self.work(operation, complete)
 
     def show_failures(self, failures):

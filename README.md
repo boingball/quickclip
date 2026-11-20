@@ -33,7 +33,10 @@ For a large first batch, try mic-only detection and **Find highlights** on a few
 
 ## Make a kill montage
 
-Enter your in-game name, set the seconds before and after each kill, and click **Make kill montage**. QuickClip scans the top-right kill feed for rows starting with your name and joins the matching moments into one MKV in filename order. It merges overlapping moments from the same recording. This mode uses Tesseract and works without mic or score detection.
+1. Open a recording or folder, enter your in-game name, and set the seconds before and after each kill. Set **Montage file limit** to `5` for a short trial, or leave it blank to scan the whole folder.
+2. Click **Find montage clips**. QuickClip runs Tesseract only on the top-right crop and looks for kill-feed rows starting with your name. It merges overlapping moments from the same recording.
+3. Select a row and click **Play clip** to preview it in FFplay. Click its **Keep** checkbox or press **Space** on the focused row to toggle it. All candidates are checked initially.
+4. Choose the output folder and click **Build montage** to join the checked clips into one MKV in filename order.
 
 Use recordings with matching video settings and OBS audio track layouts. The montage preserves every track and uses your export audio offset. OCR can miss small or blurry names, and the row match assumes the killer is shown first.
 

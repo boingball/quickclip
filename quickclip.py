@@ -330,14 +330,18 @@ def process_batch(sources, options, output=None, progress=print, *, audio_offset
         except (OSError, RuntimeError, ValueError) as error:
             result.errors.append(str(error))
         if output is not None:
-            for count, clip in enumerate(result.clips, 1):
-                report(f"Exporting clip {count}/{len(result.clips)} ({clip.start:.2f}–{clip.end:.2f}s)")
-                try:
-                    result.exports.append(export_clip(source, clip, output, progress=report,
-                                                      audio_offset_ms=audio_offset_ms))
-                except (OSError, RuntimeError) as error:
-                    result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
+            export_candidates(result, output, report, audio_offset_ms)
         yield result
+
+
+def export_candidates(result, output, progress, audio_offset_ms):
+    for count, clip in enumerate(result.clips, 1):
+        progress(f"Exporting clip {count}/{len(result.clips)} ({clip.start:.2f}–{clip.end:.2f}s)")
+        try:
+            result.exports.append(export_clip(result.source, clip, output, progress=progress,
+                                              audio_offset_ms=audio_offset_ms))
+        except (OSError, RuntimeError) as error:
+            result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
 
 
 def montage_layout(path):
@@ -348,19 +352,25 @@ def montage_layout(path):
     return info["streams"]
 
 
-def kill_montage(sources, player, before, after, output, progress=print, *, audio_offset_ms=0):
+def scan_kills(sources, player, before, after, progress=print):
     if not player.strip():
         raise ValueError("Enter your player name to make a kill montage.")
+    return process_batch(sources, (0, -18, player, "", before, after), progress=progress,
+                         killer_only=True)
+
+
+def write_montage(sources, candidates, output, progress=print, *, audio_offset_ms=0):
     prepare_output(sources, output)
     with tempfile.TemporaryDirectory(prefix=".quickclip-montage-", dir=output) as temp:
         staging = Path(temp)
         results = []
         segments = []
         layout = None
-        options = (0, -18, player, "", before, after)
-        for result in process_batch(sources, options, staging, progress,
-                                    audio_offset_ms=audio_offset_ms, killer_only=True):
+        for result in candidates:
             results.append(result)
+            if result.clips:
+                progress(f"{result.source.name} · Preparing montage clips")
+                export_candidates(result, staging, progress, audio_offset_ms)
             for segment in result.exports:
                 current = montage_layout(segment)
                 if layout is not None and current != layout:
@@ -379,6 +389,11 @@ def kill_montage(sources, player, before, after, output, progress=print, *, audi
         run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
              "-f", "concat", "-i", str(manifest), "-map", "0", "-c", "copy", str(encoded)])
         return results, publish_export(encoded, output, "kill-montage")
+
+
+def kill_montage(sources, player, before, after, output, progress=print, *, audio_offset_ms=0):
+    return write_montage(sources, scan_kills(sources, player, before, after, progress),
+                         output, progress, audio_offset_ms=audio_offset_ms)
 
 
 def parse_mic_track(value):
