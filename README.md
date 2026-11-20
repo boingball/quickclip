@@ -31,6 +31,12 @@ Auto looks for a track named **Mic** or **Microphone** first. With generic names
 
 For a large first batch, try mic-only detection and **Find highlights** on a few recordings to check your track and threshold before enabling OCR or exporting everything. Running an export again can create additional copies with numbered filenames.
 
+## Make a kill montage
+
+Enter your in-game name, set the seconds before and after each kill, and click **Make kill montage**. QuickClip scans the top-right kill feed for rows starting with your name and joins the matching moments into one MKV in filename order. It merges overlapping moments from the same recording. This mode uses Tesseract and works without mic or score detection.
+
+Use recordings with matching video settings and OBS audio track layouts. The montage preserves every track and uses your export audio offset. OCR can miss small or blurry names, and the row match assumes the killer is shown first.
+
 ## PowerShell and terminal use
 
 List the audio streams, automatically identify the mic, and show highlight candidates:
@@ -56,5 +62,13 @@ py quickclip.py "D:\OBS\Recordings" --mic-track 2 --threshold -18 --output "D:\O
 ```
 
 Omit `--output` to list candidates without exporting. A batch with errors still processes the other recordings and returns a nonzero exit code.
+
+To make a montage from the kill feed, use your in-game name:
+
+```powershell
+py quickclip.py "F:\Raw-Stream" --player boingball --kill-montage --output "F:\QuickClip-Montage"
+```
+
+The command uses three seconds before and two after each match by default. Override them with `--before` and `--after`. Use `--audio-offset-ms 1000` if the recordings need that sync adjustment.
 
 If all audio tracks play late in an exported clip, try `--audio-offset-ms -1000` to bring them one second earlier. The desktop app has the same **Export audio offset (ms)** setting. Positive values delay audio. The offset applies to all tracks during export and defaults to zero.

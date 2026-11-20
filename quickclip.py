@@ -141,7 +141,7 @@ SCORE = (.44, .38, .28, .34)
 DEFAULT_SCORE = r"\+\s*[0-9]{2,5}\b|\b[0-9]{2,5}\s*XP\b"
 
 
-def ocr_events(path, region, reason, identify, duration, progress):
+def ocr_events(path, region, reason, identify, duration, progress, *, page_mode="11"):
     width, height, left, top = region
     filters = (f"fps=2:start_time=0,crop=iw*{width}:ih*{height}:iw*{left}:ih*{top},"
                "scale=768:384,format=gray")
@@ -155,7 +155,7 @@ def ocr_events(path, region, reason, identify, duration, progress):
         timestamp = index / 2
         if index % 20 == 0:
             progress(f"Scanning {reason.lower()} at {timestamp:.0f} / {duration:.0f}s")
-        text = run(["tesseract", "stdin", "stdout", "-l", "eng", "--psm", "11"],
+        text = run(["tesseract", "stdin", "stdout", "-l", "eng", "--psm", page_mode],
                    input=header + data).decode(errors="replace")
         matches = identify(text)
         previous = set().union(*recent)
@@ -196,7 +196,8 @@ def validate_detection(track, threshold, player, score, before, after):
     return player, score_pattern
 
 
-def scan(path, recording, track, threshold, player, score, before, after, progress=print):
+def scan(path, recording, track, threshold, player, score, before, after, progress=print,
+         *, killer_only=False):
     player, score_pattern = validate_detection(track, threshold, player, score, before, after)
     levels = None
     auto = track == "auto"
@@ -218,13 +219,18 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         events.extend(microphone_events(levels, threshold, recording.duration, reason, progress))
     if player:
         player_pattern = re.compile(r"(?<!\w)" + re.escape(player) + r"(?!\w)", re.IGNORECASE)
+        killer_pattern = re.compile(r"^\s*(?:\[[^\]]+\]\s*)?" + player_pattern.pattern,
+                                    re.IGNORECASE)
 
         def feed_matches(text):
+            if killer_only:
+                return {" ".join(line.casefold().split()) for line in text.splitlines()
+                        if (match := killer_pattern.match(line)) and re.search(r"\w", line[match.end():])}
             return {" ".join(line.casefold().split()) for line in text.splitlines()
                     if player_pattern.search(line)}
 
         events.extend(ocr_events(path, FEED, "Kill feed", feed_matches,
-                                 recording.duration, progress))
+                                 recording.duration, progress, page_mode="6" if killer_only else "11"))
     if score_pattern:
         def score_matches(text):
             return {"".join(match.group().upper().split()) for match in score_pattern.finditer(text)}
@@ -264,19 +270,23 @@ def export_clip(source, clip, directory, progress=print, *, audio_offset_ms=0):
             progress("Encoder ran out of memory. Retrying with a lower-memory preset.")
             run(command + ["-threads:v", "1"] + streams
                 + ["-threads:v", "1", "-preset", "ultrafast", str(encoded)])
-        for suffix in range(10000):
-            destination = directory / (stem + (f"_{suffix}" if suffix else "") + ".mkv")
-            try:
-                # Reserve the filename before moving the completed encode into place.
-                destination.touch(exist_ok=False)
-            except FileExistsError:
-                continue
-            try:
-                encoded.replace(destination)
-            except OSError:
-                destination.unlink(missing_ok=True)
-                raise
-            return destination
+        return publish_export(encoded, directory, stem)
+
+
+def publish_export(encoded, directory, stem):
+    for suffix in range(10000):
+        destination = directory / (stem + (f"_{suffix}" if suffix else "") + ".mkv")
+        try:
+            # Reserve the filename before moving the completed encode into place.
+            destination.touch(exist_ok=False)
+        except FileExistsError:
+            continue
+        try:
+            encoded.replace(destination)
+        except OSError:
+            destination.unlink(missing_ok=True)
+            raise
+        return destination
     raise RuntimeError("Too many exports with the same name.")
 
 
@@ -296,7 +306,8 @@ def prepare_output(sources, output):
     output.mkdir(parents=True, exist_ok=True)
 
 
-def process_batch(sources, options, output=None, progress=print, *, audio_offset_ms=0):
+def process_batch(sources, options, output=None, progress=print, *, audio_offset_ms=0,
+                  killer_only=False):
     validate_detection(*options)
     for program in ("ffmpeg", "ffprobe"):
         if not shutil.which(program):
@@ -314,7 +325,8 @@ def process_batch(sources, options, output=None, progress=print, *, audio_offset
         report("Reading recording")
         result = BatchResult(source, [], [], [])
         try:
-            result.clips = scan(source, probe(source), *options, progress=report)
+            result.clips = scan(source, probe(source), *options, progress=report,
+                                killer_only=killer_only)
         except (OSError, RuntimeError, ValueError) as error:
             result.errors.append(str(error))
         if output is not None:
@@ -326,6 +338,47 @@ def process_batch(sources, options, output=None, progress=print, *, audio_offset
                 except (OSError, RuntimeError) as error:
                     result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
         yield result
+
+
+def montage_layout(path):
+    info = json.loads(run(["ffprobe", "-v", "error", "-show_entries",
+                           "stream=codec_type,codec_name,time_base,width,height,pix_fmt,sample_aspect_ratio,"
+                           "channels,channel_layout,sample_rate:stream_tags=title,language",
+                           "-of", "json", str(path)]))
+    return info["streams"]
+
+
+def kill_montage(sources, player, before, after, output, progress=print, *, audio_offset_ms=0):
+    if not player.strip():
+        raise ValueError("Enter your player name to make a kill montage.")
+    prepare_output(sources, output)
+    with tempfile.TemporaryDirectory(prefix=".quickclip-montage-", dir=output) as temp:
+        staging = Path(temp)
+        results = []
+        segments = []
+        layout = None
+        options = (0, -18, player, "", before, after)
+        for result in process_batch(sources, options, staging, progress,
+                                    audio_offset_ms=audio_offset_ms, killer_only=True):
+            results.append(result)
+            for segment in result.exports:
+                current = montage_layout(segment)
+                if layout is not None and current != layout:
+                    raise ValueError(f"{result.source.name} has a different video or audio track layout. "
+                                     "Build separate montages for recordings with matching settings.")
+                layout = current
+                name = f"segment-{len(segments):06d}.mkv"
+                segment.replace(staging / name)
+                segments.append(f"file '{name}'\n")
+        if not segments:
+            return results, None
+        progress(f"Joining {len(segments)} highlight segment(s)…")
+        manifest = staging / "segments.txt"
+        manifest.write_text("".join(segments), encoding="ascii")
+        encoded = staging / "montage.mkv"
+        run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+             "-f", "concat", "-i", str(manifest), "-map", "0", "-c", "copy", str(encoded)])
+        return results, publish_export(encoded, output, "kill-montage")
 
 
 def parse_mic_track(value):
@@ -346,9 +399,11 @@ def main():
     parser.add_argument("--player", default="", help="Enable kill-feed OCR for this name.")
     parser.add_argument("--score", action="store_true", help="Enable score popup OCR.")
     parser.add_argument("--score-pattern", help="Custom score regex, also enables score OCR.")
-    parser.add_argument("--before", type=float, default=10)
-    parser.add_argument("--after", type=float, default=6)
+    parser.add_argument("--before", type=float, help="Seconds before each cue (10; 3 for montage).")
+    parser.add_argument("--after", type=float, help="Seconds after each cue (6; 2 for montage).")
     parser.add_argument("--output", type=Path, help="Export every candidate here. Omit to list candidates.")
+    parser.add_argument("--kill-montage", action="store_true",
+                        help="Join kill-feed matches into one MKV. Requires --player and --output.")
     parser.add_argument("--audio-offset-ms", type=int, default=0,
                         help="Shift all exported audio tracks. Negative brings audio earlier; positive delays it.")
     args = parser.parse_args()
@@ -357,11 +412,26 @@ def main():
         launch()
         return
     try:
+        before = args.before if args.before is not None else (3 if args.kill_montage else 10)
+        after = args.after if args.after is not None else (2 if args.kill_montage else 6)
+        if args.kill_montage:
+            if args.output is None:
+                raise ValueError("--kill-montage requires an output folder.")
+            sources = folder_recordings(args.recording) if args.recording.is_dir() else [args.recording]
+            results, montage = kill_montage(sources, args.player, before, after, args.output,
+                                            audio_offset_ms=args.audio_offset_ms)
+            for result in results:
+                for error in result.errors:
+                    print(f"{result.source.name}: {error}", file=sys.stderr)
+            print(f"Montage: {montage}" if montage else "No kill montage was created.")
+            if any(result.errors for result in results):
+                parser.exit(1)
+            return
         score = args.score_pattern or (DEFAULT_SCORE if args.score else "")
         track = args.mic_track
         if track is None:
             track = 0 if args.player.strip() or score else "auto"
-        options = (track, args.threshold, args.player, score, args.before, args.after)
+        options = (track, args.threshold, args.player, score, before, after)
         if args.recording.is_dir():
             sources = folder_recordings(args.recording)
             failed = 0

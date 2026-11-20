@@ -8,8 +8,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 from quickclip import (
-    DEFAULT_SCORE, RECORDING_EXTENSIONS, export_clip, folder_recordings, prepare_output, probe,
-    process_batch,
+    DEFAULT_SCORE, RECORDING_EXTENSIONS, export_clip, folder_recordings, kill_montage,
+    prepare_output, probe, process_batch,
 )
 
 
@@ -83,6 +83,9 @@ class Desktop:
         self.batch_button = ttk.Button(settings, text="Scan and export all",
                                        command=lambda: self.start_scan(auto_export=True))
         self.batch_button.grid(row=4, column=3, sticky="e", pady=(4, 0))
+        self.montage_button = ttk.Button(settings, text="Make kill montage",
+                                         command=lambda: self.start_scan(montage=True))
+        self.montage_button.grid(row=5, column=3, sticky="e", pady=(4, 0))
 
         results = ttk.Frame(body)
         results.pack(fill="both", expand=True)
@@ -114,7 +117,7 @@ class Desktop:
         ready = bool(self.table.selection()) and not self.busy
         for button in (self.open_button, self.folder_button, self.output_button):
             button.configure(state="disabled" if self.busy else "normal")
-        for button in (self.scan_button, self.batch_button):
+        for button in (self.scan_button, self.batch_button, self.montage_button):
             button.configure(state="normal" if self.sources and not self.busy else "disabled")
         self.export_button.configure(state="normal" if ready else "disabled")
         self.preview_button.configure(state="normal" if ready and shutil.which("ffplay") else "disabled")
@@ -214,27 +217,33 @@ class Desktop:
             return self.output
         return None
 
-    def start_scan(self, auto_export=False):
+    def start_scan(self, auto_export=False, montage=False):
+        player = self.player.get().strip()
         try:
-            selection = self.track.current()
-            track = "auto" if selection == 0 else selection - 1
-            options = (track, float(self.threshold.get()), self.player.get(),
-                       self.score.get().strip() if self.score_enabled.get() else "",
-                       float(self.before.get()), float(self.after.get()))
-            if self.score_enabled.get() and not options[3]:
-                raise ValueError("Enter a score text pattern.")
-            audio_offset = self.read_audio_offset() if auto_export else 0
+            before, after = float(self.before.get()), float(self.after.get())
+            audio_offset = self.read_audio_offset() if auto_export or montage else 0
+            if montage:
+                if not player:
+                    raise ValueError("Enter your player name to make a kill montage.")
+            else:
+                selection = self.track.current()
+                track = "auto" if selection == 0 else selection - 1
+                score = self.score.get().strip() if self.score_enabled.get() else ""
+                if self.score_enabled.get() and not score:
+                    raise ValueError("Enter a score text pattern.")
+                options = (track, float(self.threshold.get()), player, score, before, after)
         except ValueError as error:
             messagebox.showerror("QuickClip", str(error))
             return
 
         output = None
-        if auto_export:
+        if auto_export or montage:
             output = self.output or self.default_output or self.choose_output()
             if output is None:
                 return
 
-        def complete(results):
+        def complete(value):
+            results, montage_path = value
             self.clear()
             exported = 0
             failures = []
@@ -249,7 +258,9 @@ class Desktop:
                         result.source.name, clock(clip.start), clock(clip.end),
                         ", ".join(clip.reasons)))
             status = f"Checked {len(results)} recording(s). Found {len(self.clips)} candidate(s)."
-            if output is not None:
+            if montage:
+                status += f" Saved {montage_path}." if montage_path else " No montage was created."
+            elif output is not None:
                 status += f" Exported {exported} to {output}."
             if failures:
                 status += f" {len(failures)} recording(s) had errors."
@@ -257,11 +268,19 @@ class Desktop:
             if failures:
                 self.show_failures(failures)
 
+        def progress(message):
+            self.messages.put(("progress", message))
+
+        def operation():
+            if montage:
+                return kill_montage(self.sources, player, before, after, output, progress,
+                                    audio_offset_ms=audio_offset)
+            results = list(process_batch(self.sources, options, output, progress,
+                                         audio_offset_ms=audio_offset))
+            return results, None
+
         self.status.set("Scanning recordings…")
-        self.work(lambda: list(process_batch(self.sources, options, output,
-                                            progress=lambda msg: self.messages.put(("progress", msg)),
-                                            audio_offset_ms=audio_offset)),
-                  complete)
+        self.work(operation, complete)
 
     def show_failures(self, failures):
         window = tk.Toplevel(self.root)
