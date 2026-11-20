@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 from queue import Empty, Queue
+import re
 import shutil
 import subprocess
 from tempfile import NamedTemporaryFile
@@ -34,6 +35,34 @@ def settings_path():
     return base / "quickclip" / "settings.json"
 
 
+class FeedPlayback:
+    def __init__(self, player, source, seconds):
+        self.position = None
+        self.process = subprocess.Popen(
+            [player, "-loglevel", "info", "-stats", "-autoexit", "-sync", "video",
+             "-window_title", f"QuickClip preview · {source.name}", "-ss", f"{seconds:.3f}", str(source)],
+            stderr=subprocess.PIPE, encoding="utf-8", errors="replace",
+        )
+        Thread(target=self.read_position, daemon=True).start()
+
+    def read_position(self):
+        start = 0.0
+        with self.process.stderr as stream:
+            for line in stream:
+                if match := re.search(r"Duration: .*?, start: (-?\d+(?:\.\d+)?)", line):
+                    start = float(match[1])
+                elif match := re.match(r"\s*(-?\d+\.\d+)\s+(?:A-V|M-A|M-V):", line):
+                    self.position = max(0.0, float(match[1]) - start)
+        self.process.wait()
+
+    def stop(self):
+        if self.process.poll() is None:
+            try:
+                self.process.terminate()
+            except ProcessLookupError:
+                pass
+
+
 class Desktop:
     def __init__(self, root):
         self.root = root
@@ -48,6 +77,8 @@ class Desktop:
         self.completed_files = 0
         self.scan_total = 0
         self.feed_results = []
+        self.feed_window = None
+        self.feed_playback = None
         self.kept = set()
         self.messages = Queue()
         self.status = tk.StringVar(value="Open an OBS recording or folder to get started.")
@@ -232,11 +263,17 @@ class Desktop:
                 messagebox.showwarning("QuickClip", f"Could not save settings. {error}")
 
     def close(self):
+        self.stop_feed_playback()
         if self.scan_stop is not None:
             self.scan_stop.set()
         self.root.after_cancel(self.poll_task)
         self.save_settings()
         self.root.destroy()
+
+    def stop_feed_playback(self):
+        if self.feed_playback is not None:
+            self.feed_playback.stop()
+            self.feed_playback = None
 
     def buttons(self):
         ready = bool(self.table.selection()) and not self.busy
@@ -423,22 +460,34 @@ class Desktop:
         return None
 
     def configure_feed(self):
+        if self.feed_window is not None:
+            self.feed_window.lift()
+            return
         selected = self.table.selection()
         source, start = self.sources[0], 0
         if selected:
             source, clip = self.clips[int(selected[0])]
             start = (clip.start + clip.end) / 2
         window = tk.Toplevel(self.root)
+        self.feed_window = window
         window.title("Set kill-feed area")
         frame = ttk.Frame(window, padding=12)
         frame.pack(fill="both", expand=True)
-        ttk.Label(frame, text=source.name).pack(anchor="w")
+        sources = tuple(self.sources)
+        recordings = ttk.Frame(frame)
+        recordings.pack(fill="x")
+        ttk.Label(recordings, text="Recording").pack(side="left")
+        recording = ttk.Combobox(recordings, state="readonly", values=[item.name for item in sources])
+        recording.current(sources.index(source))
+        recording.pack(side="left", fill="x", expand=True, padx=(6, 0))
         tools = ttk.Frame(frame)
         tools.pack(fill="x", pady=6)
         ttk.Label(tools, text="Frame time (seconds)").pack(side="left")
         timestamp = ttk.Entry(tools, width=8)
         timestamp.insert(0, f"{start:.1f}")
         timestamp.pack(side="left", padx=6)
+        playback_controls = ttk.Frame(frame)
+        playback_controls.pack(fill="x", pady=(0, 6))
         mode = tk.StringVar(frame, value=self.feed_mode.get())
         canvas = tk.Canvas(frame, width=640, height=360, highlightthickness=0, background="black")
         canvas.pack()
@@ -459,6 +508,21 @@ class Desktop:
         ttk.Label(divider_row, text="Automatic mode finds the gap separately for each row.").pack(side="left")
         origin = None
         photo = None
+
+        def close_area():
+            self.stop_feed_playback()
+            self.feed_window = None
+            window.destroy()
+
+        def frame_time():
+            seconds = float(timestamp.get())
+            if not math.isfinite(seconds) or seconds < 0:
+                raise ValueError
+            return seconds
+
+        def set_time(seconds):
+            timestamp.delete(0, "end")
+            timestamp.insert(0, f"{seconds:.3f}")
 
         def outline():
             canvas.delete("crop")
@@ -482,19 +546,21 @@ class Desktop:
 
         def read_frame():
             try:
-                seconds = float(timestamp.get())
-                if not math.isfinite(seconds) or seconds < 0:
-                    raise ValueError
+                seconds = frame_time()
             except ValueError:
                 messagebox.showerror("QuickClip", "Enter a nonnegative frame time.", parent=window)
                 return
             if self.busy:
                 return
+            requested_source = source
             self.status.set("Loading kill-feed preview frame…")
 
             def complete(data):
                 nonlocal photo
                 if not window.winfo_exists():
+                    return
+                if requested_source != source:
+                    read_frame()
                     return
                 if not data:
                     self.status.set("No image at that time. Try an earlier frame.")
@@ -507,9 +573,48 @@ class Desktop:
                 self.status.set("Kill-feed preview loaded.")
 
             self.work(lambda: run(["ffmpeg", "-v", "error", "-ss", f"{seconds:.3f}",
-                                   "-i", str(source), "-map", "0:V:0", "-frames:v", "1",
+                                   "-i", str(requested_source), "-map", "0:V:0", "-frames:v", "1",
                                    "-vf", "scale=760:420:force_original_aspect_ratio=decrease",
                                    "-c:v", "ppm", "-f", "image2pipe", "pipe:1"]), complete)
+
+        def change_recording(_):
+            nonlocal source, photo, origin
+            self.stop_feed_playback()
+            source = sources[recording.current()]
+            photo = origin = None
+            canvas.delete("all")
+            set_time(0)
+            use_time.configure(state="disabled")
+            read_frame()
+
+        def play_recording():
+            player = shutil.which("ffplay")
+            if player is None:
+                messagebox.showerror("QuickClip", "Install FFplay and add it to PATH to play recordings.",
+                                     parent=window)
+                return
+            try:
+                seconds = frame_time()
+            except ValueError:
+                messagebox.showerror("QuickClip", "Enter a nonnegative frame time.", parent=window)
+                return
+            self.stop_feed_playback()
+            use_time.configure(state="disabled")
+            try:
+                self.feed_playback = FeedPlayback(player, source, seconds)
+            except OSError as error:
+                messagebox.showerror("QuickClip", str(error), parent=window)
+                return
+            use_time.configure(state="normal")
+
+        def use_playback_time():
+            position = self.feed_playback.position if self.feed_playback is not None else None
+            if position is None:
+                messagebox.showinfo("QuickClip", "Play the recording, then pause on the kill before copying the time.",
+                                    parent=window)
+                return
+            set_time(position)
+            read_frame()
 
         def begin(event):
             nonlocal origin
@@ -539,24 +644,35 @@ class Desktop:
             self.fixed_feed_divider.set(fixed.get())
             self.feed_mode.set(mode.get())
             self.save_settings()
-            window.destroy()
+            close_area()
 
         def test_ocr():
             if self.busy:
                 return
             try:
-                seconds = float(timestamp.get())
-                if not math.isfinite(seconds) or seconds < 0:
-                    raise ValueError("Enter a nonnegative frame time.")
+                seconds = frame_time()
+            except ValueError:
+                messagebox.showerror("QuickClip", "Enter a nonnegative frame time.", parent=window)
+                return
+            try:
                 region = parse_feed_region(crop.get())
                 split = parse_feed_divider(divider.get()) if fixed.get() else None
             except ValueError as error:
                 messagebox.showerror("QuickClip", str(error), parent=window)
                 return
             treatment = mode.get()
+            requested_source = source
             self.status.set("Testing kill-feed OCR on one frame…")
-            self.work(lambda: preview_feed(source, seconds, region, treatment, split),
-                      lambda value: self.show_ocr_test(value, source.name, seconds, treatment))
+
+            def complete(value):
+                if not window.winfo_exists():
+                    return
+                if requested_source == source:
+                    self.show_ocr_test(value, requested_source.name, seconds, treatment)
+                else:
+                    read_frame()
+
+            self.work(lambda: preview_feed(requested_source, seconds, region, treatment, split), complete)
 
         crop.trace_add("write", lambda *_: outline())
         divider.trace_add("write", lambda *_: outline())
@@ -564,6 +680,13 @@ class Desktop:
         canvas.bind("<Button-1>", begin)
         canvas.bind("<B1-Motion>", drag)
         canvas.bind("<ButtonRelease-1>", drag)
+        window.protocol("WM_DELETE_WINDOW", close_area)
+        recording.bind("<<ComboboxSelected>>", change_recording)
+        ttk.Button(playback_controls, text="Play recording", command=play_recording).pack(side="left")
+        use_time = ttk.Button(playback_controls, text="Use playback time", command=use_playback_time,
+                              state="disabled")
+        use_time.pack(side="left", padx=6)
+        ttk.Label(playback_controls, text="In the player, use Space to pause and the arrow keys to seek.").pack(side="left")
         ttk.Button(tools, text="Load frame", command=read_frame).pack(side="left")
         ttk.Button(tools, text="Test OCR", command=test_ocr).pack(side="right")
         ttk.Combobox(tools, textvariable=mode, values=OCR_MODES, state="readonly",

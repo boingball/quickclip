@@ -42,6 +42,8 @@ Open **OCR readout** to see possible names and readable rows from each recording
 
 In **Set kill-feed area**, include the entire feed with space for long names on both sides. **Test OCR** shows the detected gaps and labels each word left, right, or unknown. **OCR readout** counts all three. A lone readable name has an unknown side in automatic mode. Use **Match name anywhere in feed** to include those moments for manual review. For a feed with a fixed split, enable **Use fixed divider** to use a single vertical line.
 
+The **Recording** list in **Set kill-feed area** lets you pick any file in the open folder. Use **Play recording** to open it in FFplay from the entered time. In FFplay, use the arrow keys to seek and **Space** to pause when the kill is visible. Return to QuickClip and click **Use playback time**, then **Test OCR**. You can adjust the frame time by hand if you want a nearby frame.
+
 If your name is always green, try **Green player**. QuickClip requires the matching name to be green and keeps the other colored names visible for the killer-side check. For names of at least six letters or digits, it also accepts one common OCR substitution, such as `l` for `i` or `o` for `0`. **OCR readout** lists those spellings separately for review. **Test OCR** marks the words it classified as green. The command-line equivalent is `--feed-text-mode green`.
 
 Enable **Use loud audio if no kill matches** for older recordings. This uses the mic threshold and selected track. Auto tries an isolated mic first and uses Track 1 when there is no clear mic. With only a mixed track, loud game audio can also trigger candidates.
