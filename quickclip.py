@@ -3,10 +3,11 @@ import argparse
 from array import array
 from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import closing, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 import csv
 from dataclasses import dataclass, field
 from functools import lru_cache
+import hashlib
 from itertools import islice
 import json
 import math
@@ -67,6 +68,11 @@ DEFAULT_MONTAGE_WORKERS = min(4, os.cpu_count() or 1)
 BACKGROUND = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
 RADEON_DECODE_ARGS = ["-xerror", "-init_hw_device", "d3d11va=radeon:,vendor_id=0x1002",
                       "-hwaccel", "d3d11va", "-hwaccel_device", "radeon"]
+MONTAGE_CHECKPOINTS = ".quickclip-montage-resume"
+
+
+class MontagePaused(Exception):
+    pass
 
 
 def run(command, **kwargs):
@@ -1031,13 +1037,13 @@ def compatible_montage_layout(layout, expected):
             == {key: value for key, value in expected[1].items() if key != "tags"})
 
 
-def pad_montage_audio(path, present, expected):
+def pad_montage_audio(path, destination, present, expected):
     missing = expected[len(present):]
     if not missing:
         return
     duration = probe(path).duration
-    padded = path.with_name("padded-" + path.name)
-    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path)]
+    padded = path.with_name("working-" + destination.name)
+    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(path)]
     for stream in missing:
         layout = stream.get("channel_layout") or f'{stream["channels"]}c'
         command += ["-f", "lavfi", "-i", f'anullsrc=r={stream["sample_rate"]}:cl={layout}']
@@ -1048,13 +1054,12 @@ def pad_montage_audio(path, present, expected):
         if stream.get("sample_fmt"):
             command += [f"-sample_fmt:a:{index}", stream["sample_fmt"]]
     run(command + [str(padded)])
-    padded.replace(path)
+    padded.replace(destination)
 
 
 @dataclass
 class MontageSegment:
     path: Path
-    export: Path
     layout: list[dict]
     result: BatchResult
 
@@ -1093,8 +1098,9 @@ def montage_audio_settings(segments, reference):
     return settings, orders
 
 
-def normalize_montage_segment(path, width, height, audio, order, progress, acceleration):
-    converted = path.with_name("converted-" + path.name)
+def normalize_montage_segment(path, destination, width, height, audio, order, progress, acceleration):
+    converted = path.with_name("working-" + destination.name)
+    converted.unlink(missing_ok=True)
     duration = probe(path).duration
     command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-filter_threads", "1"]
     streams = ["-i", str(path)]
@@ -1115,7 +1121,7 @@ def normalize_montage_segment(path, width, height, audio, order, progress, accel
                f"setsar=1,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p")
     streams += ["-vf", filters, "-fps_mode", "passthrough", "-c:a", "flac", "-sample_fmt:a", "s32"]
     encode_video(command, streams, converted, progress, acceleration, duration)
-    converted.replace(path)
+    converted.replace(destination)
 
 
 def scan_kills(sources, player, before, after, progress=print, *,
@@ -1150,30 +1156,140 @@ def scan_kills(sources, player, before, after, progress=print, *,
         pool.shutdown(cancel_futures=True)
 
 
-def write_montage(sources, candidates, output, progress=print, *, audio_offset_ms=0,
-                  acceleration=VideoAcceleration()):
+def save_montage_job(sources, candidates, output, audio_offset_ms):
     prepare_output(sources, output)
     source_order = {source: index for index, source in enumerate(sources)}
-    with tempfile.TemporaryDirectory(prefix=".quickclip-montage-", dir=output) as temp:
+    recordings = []
+    for result in sorted(candidates, key=lambda item: source_order[item.source]):
+        source = result.source.resolve()
+        stat = source.stat()
+        recordings.append({"path": str(source), "size": stat.st_size, "modified": stat.st_mtime_ns,
+                           "clips": [[clip.start, clip.end, clip.reasons] for clip in result.clips]})
+    plan = json.dumps({"version": 1, "audio_offset_ms": audio_offset_ms, "recordings": recordings},
+                      ensure_ascii=False).encode("utf-8")
+    directory = output / MONTAGE_CHECKPOINTS / hashlib.sha256(plan).hexdigest()
+    directory.mkdir(parents=True, exist_ok=True)
+    job = directory / "job.json"
+    with tempfile.NamedTemporaryFile(dir=directory, delete=False) as stream:
+        temporary = Path(stream.name)
+        stream.write(plan)
+    temporary.replace(job)
+    return job
+
+
+def latest_montage_job(output):
+    if output is None:
+        return None
+    try:
+        return max((output / MONTAGE_CHECKPOINTS).glob("*/job.json"),
+                   key=lambda path: path.stat().st_mtime_ns, default=None)
+    except OSError:
+        return None
+
+
+@contextmanager
+def lock_montage_job(directory):
+    with (directory / "job.lock").open("a+b") as handle:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            def lock():
+                msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+
+            def unlock():
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            def lock():
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+            def unlock():
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        try:
+            lock()
+        except OSError as error:
+            raise RuntimeError("This montage is already running in another QuickClip window.") from error
+        try:
+            yield
+        finally:
+            unlock()
+
+
+def resume_montage_job(job, output, progress=print, *, acceleration=VideoAcceleration(), stop=None):
+    with lock_montage_job(job.parent):
+        plan = json.loads(job.read_text(encoding="utf-8"))
+        if plan.get("version") != 1:
+            raise ValueError("This saved montage uses an unsupported format.")
+        candidates = []
+        for recording in plan["recordings"]:
+            source = Path(recording["path"])
+            stat = source.stat()
+            if (stat.st_size, stat.st_mtime_ns) != (recording["size"], recording["modified"]):
+                raise ValueError(f"{source.name} changed since this montage started. Build a new montage for that recording.")
+            clips = [Clip(start, end, tuple(reasons)) for start, end, reasons in recording["clips"]]
+            candidates.append(BatchResult(source, clips, [], []))
+        results, path = write_montage([result.source for result in candidates], candidates, output, progress,
+                                     audio_offset_ms=plan["audio_offset_ms"], acceleration=acceleration,
+                                     checkpoint=job.parent, stop=stop)
+        if path and not any(result.errors for result in results):
+            job.unlink()
+            for cached in [*job.parent.glob("*.mkv"), job.parent / "segments.txt"]:
+                try:
+                    cached.unlink(missing_ok=True)
+                except OSError as error:
+                    progress(f"Could not remove montage cache file {cached.name}. {error}")
+        return results, path
+
+
+def check_montage_pause(stop):
+    if stop is not None and stop.is_set():
+        raise MontagePaused
+
+
+def write_montage(sources, candidates, output, progress=print, *, audio_offset_ms=0,
+                  acceleration=VideoAcceleration(), checkpoint=None, stop=None):
+    prepare_output(sources, output)
+    source_order = {source: index for index, source in enumerate(sources)}
+    workspace = nullcontext(checkpoint) if checkpoint else tempfile.TemporaryDirectory(
+        prefix=".quickclip-montage-", dir=output)
+    with workspace as temp:
         staging = Path(temp)
         results = []
         segments = []
         for result in candidates:
             results.append(result)
-            if result.clips:
-                progress(f"{result.source.name} · Preparing montage clips")
-                export_candidates(result, staging, progress, audio_offset_ms, acceleration)
-            for segment in tuple(result.exports):
+            source_index = source_order[result.source]
+            for clip_index, clip in enumerate(result.clips, 1):
+                check_montage_pause(stop)
+                path = staging / f"segment-{source_index:06d}-{clip_index:06d}.mkv"
+                label = f"{result.source.name} · Clip {clip_index}/{len(result.clips)}"
+
+                def report(message):
+                    progress(f"{label} · {message}")
+
                 try:
-                    layout = montage_layout(segment)
+                    layout = None
+                    if path.is_file():
+                        try:
+                            layout = montage_layout(path)
+                            report("Reusing encoded clip.")
+                        except (OSError, RuntimeError, ValueError):
+                            path.unlink(missing_ok=True)
+                    if layout is None:
+                        report(f"Exporting {clip.start:.2f}–{clip.end:.2f}s")
+                        with tempfile.TemporaryDirectory(prefix=".clip-", dir=staging) as scratch:
+                            encoded = export_clip(result.source, clip, Path(scratch), progress=report,
+                                                  audio_offset_ms=audio_offset_ms, acceleration=acceleration)
+                            layout = montage_layout(encoded)
+                            encoded.replace(path)
                 except (OSError, RuntimeError, ValueError) as error:
-                    result.errors.append(f"Could not inspect {segment.name}. {error}")
-                    result.exports.remove(segment)
+                    result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
                     continue
-                name = f"segment-{len(segments):06d}.mkv"
-                path = staging / name
-                segment.replace(path)
-                segments.append(MontageSegment(path, segment, layout, result))
+                result.exports.append(path)
+                segments.append(MontageSegment(path, layout, result))
+        check_montage_pause(stop)
         if not segments:
             return results, None
         segments.sort(key=lambda segment: source_order[segment.result.source])
@@ -1189,28 +1305,41 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
             progress(f"Converting mixed recordings to a {width}×{height} montage…")
         ready = []
         for index, (segment, order) in enumerate(zip(segments, orders), 1):
+            check_montage_pause(stop)
             try:
                 if mixed:
-                    progress(f"Converting clip {index}/{len(segments)} · {segment.result.source.name}")
+                    key = hashlib.sha256(json.dumps([width, height, audio, order], sort_keys=True).encode()).hexdigest()[:12]
+                    destination = staging / f"ready-{key}-{segment.path.name}"
 
                     def report(message):
                         progress(f"Converting clip {index}/{len(segments)} · {message}")
 
-                    normalize_montage_segment(segment.path, width, height, audio, order, report, acceleration)
+                    if destination.is_file():
+                        report("Reusing converted clip.")
+                    else:
+                        report(segment.result.source.name)
+                        normalize_montage_segment(segment.path, destination, width, height, audio,
+                                                  order, report, acceleration)
+                elif len(segment.layout) < len(expected):
+                    key = hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest()[:12]
+                    destination = staging / f"padded-{key}-{segment.path.name}"
+                    if not destination.is_file():
+                        pad_montage_audio(segment.path, destination, segment.layout, expected)
                 else:
-                    pad_montage_audio(segment.path, segment.layout, expected)
+                    destination = segment.path
             except (OSError, RuntimeError, ValueError) as error:
-                segment.result.errors.append(f"Could not prepare {segment.export.name} for the montage. {error}")
-                segment.result.exports.remove(segment.export)
+                segment.result.errors.append(f"Could not prepare {segment.path.name} for the montage. {error}")
+                segment.result.exports.remove(segment.path)
                 continue
-            ready.append(segment.path.name)
+            ready.append(destination.name)
+        check_montage_pause(stop)
         if not ready:
             return results, None
         progress(f"Joining {len(ready)} highlight segment(s)…")
         manifest = staging / "segments.txt"
         manifest.write_text("".join(f"file '{name}'\n" for name in ready), encoding="ascii")
         encoded = staging / "montage.mkv"
-        command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                    "-f", "concat", "-i", str(manifest), "-map", "0", "-c", "copy"]
         for index, stream in enumerate(audio):
             tags = stream.get("tags", {})

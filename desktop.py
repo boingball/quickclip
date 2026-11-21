@@ -18,9 +18,9 @@ from tkinter import filedialog, messagebox, ttk
 from quickclip import (
     BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, FEED, GREEN_PLAYER, KillFeedOptions, NAME_TOKEN, OCR_MODES,
     RECORDING_EXTENSIONS, export_clip, folder_recordings, parse_feed_divider, parse_feed_region, prepare_output,
-    SkullReference, VideoAcceleration, badge_scores, kill_badge_match, make_skull_reference, preview_feed,
-    preview_kill_badge, probe, process_batch, resolve_video_acceleration, run, scan_kills,
-    skull_search_area, skull_search_preview, write_montage,
+    MontagePaused, SkullReference, VideoAcceleration, badge_scores, kill_badge_match, latest_montage_job,
+    make_skull_reference, preview_feed, preview_kill_badge, probe, process_batch, resolve_video_acceleration,
+    resume_montage_job, run, save_montage_job, scan_kills, skull_search_area, skull_search_preview,
 )
 
 MONTAGE_CUES = ("Kill feed", "KILL badge", "Both")
@@ -79,6 +79,8 @@ class Desktop:
         self.montage_review = False
         self.montage_scanning = False
         self.scan_stop = None
+        self.montage_pause = None
+        self.close_after_montage = False
         self.completed_files = 0
         self.scan_total = 0
         self.feed_results = []
@@ -200,10 +202,13 @@ class Desktop:
         self.preview_button.pack(side="left")
         self.feed_button = ttk.Button(actions, text="OCR readout", command=self.show_feed_results)
         self.feed_button.pack(side="left", padx=(6, 0))
+        self.resume_button = ttk.Button(actions, text="Resume montage", command=self.resume_montage)
+        self.resume_button.pack(side="left", padx=(6, 0))
         ttk.Label(actions, textvariable=self.keep_count).pack(side="left", padx=10)
         self.export_button = ttk.Button(actions, text="Export selected…", command=self.export)
         self.export_button.pack(side="right")
         self.build_button = ttk.Button(actions, text="Build montage", command=self.build_montage)
+        self.pause_button = ttk.Button(actions, text="Pause montage", command=self.pause_montage)
         ttk.Label(body, textvariable=self.status, wraplength=680).pack(fill="x", pady=(10, 0))
 
         self.busy = False
@@ -292,6 +297,10 @@ class Desktop:
                 messagebox.showwarning("QuickClip", f"Could not save settings. {error}")
 
     def close(self):
+        if self.montage_pause is not None:
+            self.close_after_montage = True
+            self.pause_montage()
+            return
         self.stop_feed_playback()
         if self.scan_stop is not None:
             self.scan_stop.set()
@@ -314,6 +323,13 @@ class Desktop:
         self.feed_button.configure(state="normal" if self.feed_results else "disabled")
         self.export_button.configure(state="normal" if ready else "disabled")
         self.build_button.configure(state="normal" if self.kept and not self.busy else "disabled")
+        directory = self.output or self.default_output
+        self.resume_button.configure(state="normal" if not self.busy and latest_montage_job(directory) else "disabled")
+        if self.montage_pause is not None:
+            self.pause_button.pack(side="right", padx=(0, 6))
+            self.pause_button.configure(state="disabled" if self.montage_pause.is_set() else "normal")
+        else:
+            self.pause_button.pack_forget()
         self.preview_button.configure(state="normal" if can_preview and shutil.which("ffplay") else "disabled")
 
     def work(self, operation, complete):
@@ -323,6 +339,8 @@ class Desktop:
         def worker():
             try:
                 self.messages.put(("done", (complete, operation())))
+            except MontagePaused:
+                self.messages.put(("paused", None))
             except Exception as error:
                 self.messages.put(("error", str(error)))
 
@@ -333,7 +351,8 @@ class Desktop:
             while True:
                 kind, value = self.messages.get_nowait()
                 if kind == "progress":
-                    self.status.set(value)
+                    if self.montage_pause is None or not self.montage_pause.is_set():
+                        self.status.set(value)
                     continue
                 if kind == "montage_result":
                     self.completed_files += 1
@@ -343,11 +362,17 @@ class Desktop:
                     self.buttons()
                     continue
                 self.busy = False
+                self.montage_pause = None
+                if self.close_after_montage:
+                    self.close()
+                    return
                 if self.montage_scanning:
                     self.montage_scanning = False
                     self.scan_stop = None
                     self.update_keep_count()
-                if kind == "error":
+                if kind == "paused":
+                    self.status.set("Montage paused. Completed clips are saved. Click Resume montage to continue.")
+                elif kind == "error":
                     self.status.set("Operation failed.")
                     messagebox.showerror("QuickClip", value)
                 else:
@@ -485,6 +510,7 @@ class Desktop:
             self.output = Path(directory)
             self.show_output()
             self.save_settings()
+            self.buttons()
             return self.output
         return None
 
@@ -1042,19 +1068,35 @@ class Desktop:
         directory = self.output or self.default_output or self.choose_output()
         if directory is None:
             return
-        self.save_settings()
         clips = [self.clips[index] for index in sorted(self.kept)]
         candidates = [BatchResult(source, [clip for _, clip in group], [], [])
                       for source, group in groupby(clips, key=lambda item: item[0])]
+        self.start_montage_export(directory, lambda: save_montage_job(self.sources, candidates, directory, audio_offset))
+
+    def resume_montage(self):
+        directory = self.output or self.default_output
+        job = latest_montage_job(directory)
+        if job is not None:
+            self.start_montage_export(directory, lambda: job)
+
+    def pause_montage(self):
+        if self.montage_pause is not None:
+            self.montage_pause.set()
+            self.status.set("Pausing after the current export step finishes…")
+            self.buttons()
+
+    def start_montage_export(self, directory, get_job):
+        self.save_settings()
         requested = VideoAcceleration(self.radeon_encode.get(), self.radeon_decode.get())
+        pause = Event()
+        self.montage_pause = pause
 
         def operation():
             def progress(message):
                 self.messages.put(("progress", message))
 
             acceleration = resolve_video_acceleration(requested, progress)
-            return write_montage(self.sources, candidates, directory, progress,
-                                 audio_offset_ms=audio_offset, acceleration=acceleration)
+            return resume_montage_job(get_job(), directory, progress, acceleration=acceleration, stop=pause)
 
         def complete(value):
             results, path = value
