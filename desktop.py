@@ -1186,7 +1186,11 @@ class Desktop:
             results, path = value
             failures = [(result.source, result.errors) for result in results if result.errors]
             count = sum(len(result.exports) for result in results)
-            self.status.set(f"Saved {count} clip(s) to {path}." if path else "No montage was created.")
+            if path:
+                joined = " · Join 100%" if not failures else ""
+                self.status.set(f"Saved {count} clip(s) to {path}{joined}")
+            else:
+                self.status.set("No montage was created.")
             if failures:
                 self.show_failures(failures)
             elif path and self.can_shutdown and self.shutdown_when_finished.get() and not pause.is_set():

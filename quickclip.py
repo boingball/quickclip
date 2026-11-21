@@ -90,6 +90,7 @@ def run_export(command, description, progress, duration=None):
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, encoding="utf-8",
                               errors="replace", **BACKGROUND) as process:
             stats = {}
+            seconds = 0.0
             try:
                 for line in process.stdout:
                     key, separator, value = line.strip().partition("=")
@@ -100,12 +101,15 @@ def run_export(command, description, progress, duration=None):
                         continue
                     frame = stats.get("frame", "")
                     if frame.isdecimal() and int(frame) > 0:
-                        details = [description, f"{frame} frames"]
+                        details = [description]
                         timestamp = stats.get("out_time_us", "")
                         if timestamp.lstrip("-").isdecimal():
-                            seconds = max(0, int(timestamp) / 1_000_000)
+                            seconds = max(seconds, int(timestamp) / 1_000_000)
+                            if duration:
+                                details.append(f"{min(99, int(100 * seconds / duration))}%")
                             span = f" / {duration:.1f}s" if duration is not None else ""
                             details.append(f"{seconds:.1f}s{span} written")
+                        details.append(f"{frame} frames")
                         speed = stats.get("speed", "")
                         if speed.endswith("x"):
                             details.append(speed)
@@ -1019,12 +1023,15 @@ def export_candidates(result, output, progress, audio_offset_ms, acceleration):
             result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
 
 
-def montage_layout(path):
+def montage_segment_info(path):
     info = json.loads(run(["ffprobe", "-v", "error", "-show_entries",
                            "stream=codec_type,codec_name,time_base,width,height,pix_fmt,sample_aspect_ratio,"
-                           "channels,channel_layout,sample_rate,sample_fmt:stream_tags=title,language",
+                           "channels,channel_layout,sample_rate,sample_fmt:stream_tags=title,language:format=duration",
                            "-of", "json", str(path)]))
-    return info["streams"]
+    duration = float(info.get("format", {}).get("duration", 0))
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("Montage segment needs a readable duration.")
+    return info["streams"], duration
 
 
 def compatible_montage_layout(layout, expected):
@@ -1061,6 +1068,7 @@ def pad_montage_audio(path, destination, present, expected):
 class MontageSegment:
     path: Path
     layout: list[dict]
+    duration: float
     result: BatchResult
 
 
@@ -1273,7 +1281,7 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
                     layout = None
                     if path.is_file():
                         try:
-                            layout = montage_layout(path)
+                            layout, duration = montage_segment_info(path)
                             report("Reusing encoded clip.")
                         except (OSError, RuntimeError, ValueError):
                             path.unlink(missing_ok=True)
@@ -1282,13 +1290,13 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
                         with tempfile.TemporaryDirectory(prefix=".clip-", dir=staging) as scratch:
                             encoded = export_clip(result.source, clip, Path(scratch), progress=report,
                                                   audio_offset_ms=audio_offset_ms, acceleration=acceleration)
-                            layout = montage_layout(encoded)
+                            layout, duration = montage_segment_info(encoded)
                             encoded.replace(path)
                 except (OSError, RuntimeError, ValueError) as error:
                     result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
                     continue
                 result.exports.append(path)
-                segments.append(MontageSegment(path, layout, result))
+                segments.append(MontageSegment(path, layout, duration, result))
         check_montage_pause(stop)
         if not segments:
             return results, None
@@ -1327,17 +1335,19 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
                         pad_montage_audio(segment.path, destination, segment.layout, expected)
                 else:
                     destination = segment.path
+                duration = segment.duration if destination == segment.path else montage_segment_info(destination)[1]
             except (OSError, RuntimeError, ValueError) as error:
                 segment.result.errors.append(f"Could not prepare {segment.path.name} for the montage. {error}")
                 segment.result.exports.remove(segment.path)
                 continue
-            ready.append(destination.name)
+            ready.append((destination.name, duration))
         check_montage_pause(stop)
         if not ready:
             return results, None
-        progress(f"Joining {len(ready)} highlight segment(s)…")
+        total_duration = sum(duration for _, duration in ready)
+        progress(f"Joining montage · 0% · {len(ready)} highlight segment(s)")
         manifest = staging / "segments.txt"
-        manifest.write_text("".join(f"file '{name}'\n" for name in ready), encoding="ascii")
+        manifest.write_text("".join(f"file '{name}'\n" for name, _ in ready), encoding="ascii")
         encoded = staging / "montage.mkv"
         command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                    "-f", "concat", "-i", str(manifest), "-map", "0", "-c", "copy"]
@@ -1345,8 +1355,10 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
             tags = stream.get("tags", {})
             for key in ("title", "language"):
                 command += [f"-metadata:s:a:{index}", f"{key}={tags.get(key, '')}"]
-        run_export(command + [str(encoded)], "Joining montage", progress)
-        return results, publish_export(encoded, output, "kill-montage")
+        run_export(command + [str(encoded)], "Joining montage", progress, total_duration)
+        destination = publish_export(encoded, output, "kill-montage")
+        progress("Joining montage · 100% · MKV saved")
+        return results, destination
 
 
 def kill_montage(sources, player, before, after, output, progress=print, *,
