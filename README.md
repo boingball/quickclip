@@ -56,7 +56,7 @@ For washed-out lettering, try **Faint text** in **Test feed OCR** first. It boos
 
 Enable **Use loud audio if no kill matches** for older recordings. This uses the mic threshold and selected track. Auto tries an isolated mic first and uses Track 1 when there is no clear mic. With only a mixed track, loud game audio can also trigger candidates.
 
-Use recordings with compatible video and audio formats. The montage preserves all audio tracks and uses your export audio offset. When mixing a single-track recording with a compatible multitrack recording, QuickClip treats the single track as the main track and fills the missing tracks with silence. Other incompatible layouts need separate montages.
+QuickClip joins compatible clips directly. With mixed formats it re-encodes them to the first clip's resolution, fits each picture without stretching, and uses 48 kHz audio. It keeps the audio tracks, aligns shared track titles where possible, and fills missing tracks with silence. The export audio offset still applies.
 
 QuickClip remembers your last input, output folder, and settings. On Windows it stores them in `%APPDATA%\QuickClip\settings.json`.
 

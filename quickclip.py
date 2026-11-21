@@ -782,19 +782,23 @@ def export_clip(source, clip, directory, progress=print, *, audio_offset_ms=0):
                    # Preserve the recording's frame cadence and audio timestamp gaps.
                    "-fps_mode", "passthrough", "-af", audio_filter,
                    "-c:v", "libx264", "-crf", "18", "-c:a", "flac"]
-        try:
-            run(command + ["-threads:v", "2"] + streams
-                + ["-threads:v", "2", "-preset", "fast", "-x264-params",
-                   "rc-lookahead=12:lookahead-threads=1", str(encoded)])
-        except RuntimeError as error:
-            if not re.search(r"malloc of size .* failed|cannot allocate memory|out of memory",
-                             str(error), re.IGNORECASE):
-                raise
-            encoded.unlink(missing_ok=True)
-            progress("Encoder ran out of memory. Retrying with a lower-memory preset.")
-            run(command + ["-threads:v", "1"] + streams
-                + ["-threads:v", "1", "-preset", "ultrafast", str(encoded)])
+        encode_x264(command, streams, encoded, progress)
         return publish_export(encoded, directory, stem)
+
+
+def encode_x264(command, streams, encoded, progress):
+    try:
+        run(command + ["-threads:v", "2"] + streams
+            + ["-threads:v", "2", "-preset", "fast", "-x264-params",
+               "rc-lookahead=12:lookahead-threads=1", str(encoded)])
+    except RuntimeError as error:
+        if not re.search(r"malloc of size .* failed|cannot allocate memory|out of memory",
+                         str(error), re.IGNORECASE):
+            raise
+        encoded.unlink(missing_ok=True)
+        progress("Encoder ran out of memory. Retrying with a lower-memory preset.")
+        run(command + ["-threads:v", "1"] + streams
+            + ["-threads:v", "1", "-preset", "ultrafast", str(encoded)])
 
 
 def publish_export(encoded, directory, stem):
@@ -918,6 +922,74 @@ def pad_montage_audio(path, present, expected):
     padded.replace(path)
 
 
+@dataclass
+class MontageSegment:
+    path: Path
+    export: Path
+    layout: list[dict]
+    result: BatchResult
+
+
+def audio_slot_order(streams, preferred):
+    """Align unique shared titles first, then use the original track positions."""
+    titles = [stream.get("tags", {}).get("title", "").casefold().strip() for stream in streams]
+    slots = [None] * len(preferred)
+    remaining = []
+    for index, title in enumerate(titles):
+        if title and titles.count(title) == preferred.count(title) == 1:
+            slots[preferred.index(title)] = index
+        else:
+            remaining.append(index)
+    for index in remaining:
+        slots[index if slots[index] is None else slots.index(None)] = index
+    return slots
+
+
+def montage_audio_settings(segments, reference):
+    preferred = [stream.get("tags", {}).get("title", "").casefold().strip() for stream in reference]
+    orders = [audio_slot_order(segment.layout[1:], preferred) for segment in segments]
+    settings = []
+    for index, reference_stream in enumerate(reference):
+        present = [segment.layout[order[index] + 1] for segment, order in zip(segments, orders)
+                   if order[index] is not None]
+        richest = max(present, key=lambda stream: stream["channels"])
+        tags = dict(reference_stream.get("tags", {}))
+        titles = {stream.get("tags", {}).get("title", "").casefold().strip() for stream in present}
+        if len(titles - {""}) > 1:
+            tags["title"] = f"Audio track {index + 1}"
+        settings.append({
+            "channel_layout": richest.get("channel_layout") or f'{richest["channels"]}c',
+            "tags": tags,
+        })
+    return settings, orders
+
+
+def normalize_montage_segment(path, width, height, audio, order, progress):
+    converted = path.with_name("converted-" + path.name)
+    duration = probe(path).duration
+    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-filter_threads", "1"]
+    streams = ["-i", str(path)]
+    silence = {}
+    for slot, stream in enumerate(audio):
+        if order[slot] is None:
+            silence[slot] = len(silence) + 1
+            streams += ["-f", "lavfi", "-i", f'anullsrc=r=48000:cl={stream["channel_layout"]}']
+    streams += ["-t", f"{duration:.3f}", "-map", "0:V:0", "-map_chapters", "-1"]
+    for slot, stream in enumerate(audio):
+        index = order[slot]
+        streams += ["-map", f"0:a:{index}" if index is not None else f"{silence[slot]}:a:0",
+                    f"-channel_layout:a:{slot}", stream["channel_layout"],
+                    f"-filter:a:{slot}", "aresample=48000:async=1:first_pts=0,apad"]
+    # Fit the display aspect ratio inside the first recording's canvas.
+    filters = (f"scale=w='max(2,trunc(min({width},{height}*dar)/2)*2)':"
+               f"h='max(2,trunc(min({height},{width}/dar)/2)*2)',"
+               f"setsar=1,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p")
+    streams += ["-vf", filters, "-fps_mode", "passthrough", "-c:v", "libx264", "-crf", "18",
+                "-c:a", "flac", "-sample_fmt:a", "s32"]
+    encode_x264(command, streams, converted, progress)
+    converted.replace(path)
+
+
 def scan_kills(sources, player, before, after, progress=print, *,
                workers=DEFAULT_MONTAGE_WORKERS, stop=None, feed=KillFeedOptions()):
     if not player.strip() and not feed.badge:
@@ -961,26 +1033,52 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
             if result.clips:
                 progress(f"{result.source.name} · Preparing montage clips")
                 export_candidates(result, staging, progress, audio_offset_ms)
-            for clip_index, segment in enumerate(result.exports):
-                layout = montage_layout(segment)
+            for segment in tuple(result.exports):
+                try:
+                    layout = montage_layout(segment)
+                except (OSError, RuntimeError, ValueError) as error:
+                    result.errors.append(f"Could not inspect {segment.name}. {error}")
+                    result.exports.remove(segment)
+                    continue
                 name = f"segment-{len(segments):06d}.mkv"
-                segment.replace(staging / name)
-                segments.append((source_order[result.source], clip_index, name, layout))
+                path = staging / name
+                segment.replace(path)
+                segments.append(MontageSegment(path, segment, layout, result))
         if not segments:
             return results, None
-        progress(f"Joining {len(segments)} highlight segment(s)…")
-        expected = max((layout for _, _, _, layout in segments), key=len)
-        for source_index, _, name, layout in segments:
-            if not compatible_montage_layout(layout, expected):
-                raise ValueError(f"{sources[source_index].name} has a different video or audio layout. "
-                                 "Build separate montages for recordings with matching settings.")
-            pad_montage_audio(staging / name, layout, expected)
+        segments.sort(key=lambda segment: source_order[segment.result.source])
+        expected = max((segment.layout for segment in segments), key=len)
+        mixed = any(not compatible_montage_layout(segment.layout, expected) for segment in segments)
+        audio = expected[1:]
+        orders = [()] * len(segments)
+        if mixed:
+            first_video = segments[0].layout[0]
+            width = max(2, first_video["width"] // 2 * 2)
+            height = max(2, first_video["height"] // 2 * 2)
+            audio, orders = montage_audio_settings(segments, audio)
+            progress(f"Converting mixed recordings to a {width}×{height} montage…")
+        ready = []
+        for index, (segment, order) in enumerate(zip(segments, orders), 1):
+            try:
+                if mixed:
+                    progress(f"Converting clip {index}/{len(segments)} · {segment.result.source.name}")
+                    normalize_montage_segment(segment.path, width, height, audio, order, progress)
+                else:
+                    pad_montage_audio(segment.path, segment.layout, expected)
+            except (OSError, RuntimeError, ValueError) as error:
+                segment.result.errors.append(f"Could not prepare {segment.export.name} for the montage. {error}")
+                segment.result.exports.remove(segment.export)
+                continue
+            ready.append(segment.path.name)
+        if not ready:
+            return results, None
+        progress(f"Joining {len(ready)} highlight segment(s)…")
         manifest = staging / "segments.txt"
-        manifest.write_text("".join(f"file '{name}'\n" for _, _, name, _ in sorted(segments)), encoding="ascii")
+        manifest.write_text("".join(f"file '{name}'\n" for name in ready), encoding="ascii")
         encoded = staging / "montage.mkv"
         command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                    "-f", "concat", "-i", str(manifest), "-map", "0", "-c", "copy"]
-        for index, stream in enumerate(expected[1:]):
+        for index, stream in enumerate(audio):
             tags = stream.get("tags", {})
             for key in ("title", "language"):
                 command += [f"-metadata:s:a:{index}", f"{key}={tags.get(key, '')}"]
