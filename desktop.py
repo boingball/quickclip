@@ -1,5 +1,6 @@
 """Tk desktop interface for QuickClip."""
 from collections import Counter
+from dataclasses import asdict
 from itertools import groupby
 import json
 import math
@@ -17,8 +18,8 @@ from tkinter import filedialog, messagebox, ttk
 from quickclip import (
     BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, FEED, GREEN_PLAYER, KillFeedOptions, NAME_TOKEN, OCR_MODES,
     RECORDING_EXTENSIONS, export_clip, folder_recordings, parse_feed_divider, parse_feed_region, prepare_output,
-    badge_scores, kill_badge_match, preview_feed, preview_kill_badge, probe, process_batch, run,
-    scan_kills, skull_search_area, write_montage,
+    SkullReference, badge_scores, kill_badge_match, make_skull_reference, preview_feed, preview_kill_badge,
+    probe, process_batch, run, scan_kills, skull_search_area, skull_search_preview, write_montage,
 )
 
 MONTAGE_CUES = ("Kill feed", "KILL badge", "Both")
@@ -98,6 +99,7 @@ class Desktop:
         self.any_feed_mention = tk.BooleanVar()
         self.audio_fallback = tk.BooleanVar()
         self.montage_cue = tk.StringVar(value=MONTAGE_CUES[0])
+        self.skull_reference = None
 
         root.title("QuickClip")
         root.minsize(720, 460)
@@ -238,6 +240,12 @@ class Desktop:
             self.feed_mode.set(values["feed_mode"])
         if values.get("montage_cue") in MONTAGE_CUES:
             self.montage_cue.set(values["montage_cue"])
+        stored_reference = values.get("skull_reference")
+        if isinstance(stored_reference, dict):
+            try:
+                self.skull_reference = SkullReference(tuple(stored_reference["box"]), tuple(stored_reference["pixels"]))
+            except (KeyError, TypeError, ValueError):
+                pass
         if isinstance(values.get("output"), str) and values["output"]:
             self.output = Path(values["output"])
             self.show_output()
@@ -253,6 +261,8 @@ class Desktop:
                       any_feed_mention=self.any_feed_mention.get(), audio_fallback=self.audio_fallback.get(),
                       feed_mode=self.feed_mode.get(), feed_divider=self.feed_divider.get(),
                       fixed_feed_divider=self.fixed_feed_divider.get(), montage_cue=self.montage_cue.get())
+        if self.skull_reference is not None:
+            values["skull_reference"] = asdict(self.skull_reference)
         temp = None
         try:
             self.settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -747,32 +757,105 @@ class Desktop:
                                        fill="#1675a4", width=2)
         canvas.pack(anchor="w")
         detail = tk.Text(frame, width=70, height=9, wrap="word")
+
+        def render_details():
+            detail.configure(state="normal")
+            detail.delete("1.0", "end")
+            if badge:
+                evidence = kill_badge_match(image, rows, self.skull_reference)
+                verdict = "Detected" if evidence else "No match"
+                detail.insert("end", f"KILL badge · {verdict} on this frame\n\n")
+                if evidence:
+                    detail.insert("end", f"Matched by {evidence}.\n\n")
+                if scores:
+                    score_text = ", ".join(score.text for score in scores)
+                    detail.insert("end", f"Score read · {score_text}\nBlue outlines the score. Yellow marks the skull search area.\n\n")
+            if rows:
+                for row in rows:
+                    if badge:
+                        words = " ".join(f"{word.text} [{word.confidence:.0f}]" for word in row.words)
+                    else:
+                        words = " ".join(
+                            f"{word.text} [{word.confidence:.0f}, {row.side(word)}"
+                            f"{', green' if word.green else ''}]"
+                            for word in row.words)
+                    detail.insert("end", words + "\n")
+                if not badge and not any(row.readable for row in rows):
+                    detail.insert("end", "\nNo confident name-like text on this frame.")
+            else:
+                detail.insert("end", "Tesseract read no text on this frame.")
+            detail.configure(state="disabled")
+
+        if scores:
+            score = max(scores, key=lambda word: word.confidence)
+            self.add_skull_reference_controls(frame, image, score, render_details)
         detail.pack(fill="both", expand=True, pady=(8, 0))
-        if badge:
-            evidence = kill_badge_match(image, rows)
-            verdict = "Detected" if evidence else "No match"
-            detail.insert("end", f"KILL badge · {verdict} on this frame\n\n")
-            if evidence:
-                detail.insert("end", f"Matched by {evidence}.\n\n")
-            if scores:
-                score_text = ", ".join(score.text for score in scores)
-                detail.insert("end", f"Score read · {score_text}\nBlue outlines the score. Yellow marks the skull search area.\n\n")
-        if rows:
-            for row in rows:
-                if badge:
-                    words = " ".join(f"{word.text} [{word.confidence:.0f}]" for word in row.words)
-                else:
-                    words = " ".join(
-                        f"{word.text} [{word.confidence:.0f}, {row.side(word)}"
-                        f"{', green' if word.green else ''}]"
-                        for word in row.words)
-                detail.insert("end", words + "\n")
-            if not badge and not any(row.readable for row in rows):
-                detail.insert("end", "\nNo confident name-like text on this frame.")
-        else:
-            detail.insert("end", "Tesseract read no text on this frame.")
-        detail.configure(state="disabled")
+        render_details()
         self.status.set("KILL badge OCR test complete." if badge else "Kill-feed OCR test complete.")
+
+    def add_skull_reference_controls(self, frame, image, score, render_details):
+        crop = skull_search_preview(image, score)
+        if crop is None:
+            return
+        zone = ttk.LabelFrame(frame, text="Skull reference", padding=8)
+        zone.pack(fill="x", pady=(8, 0))
+        ttk.Label(zone, text="Draw a box around the skull only in this zoomed view.").pack(anchor="w")
+        zoom = 3
+        photo = tk.PhotoImage(master=zone, data=crop, format="PPM").zoom(zoom)
+        canvas = tk.Canvas(zone, width=photo.width(), height=photo.height(), highlightthickness=0)
+        canvas.image = photo
+        canvas.create_image(0, 0, image=photo, anchor="nw")
+        canvas.pack(anchor="w", pady=4)
+        controls = ttk.Frame(zone)
+        controls.pack(fill="x")
+        left, top, right, bottom = skull_search_area(score)
+        start = None
+        selection = None
+
+        def drag(event):
+            nonlocal selection
+            if start is None:
+                return
+            x = min(right, max(left, left + round(event.x / zoom)))
+            y = min(bottom, max(top, top + round(event.y / zoom)))
+            x1, x2 = sorted((start[0], x))
+            y1, y2 = sorted((start[1], y))
+            selection = (x1, y1, x2, y2)
+            canvas.delete("selection")
+            canvas.create_rectangle((x1 - left) * zoom, (y1 - top) * zoom,
+                                    (x2 - left) * zoom, (y2 - top) * zoom,
+                                    outline="#ffe15c", width=2, tags="selection")
+            save_button.configure(state="normal" if x1 < x2 and y1 < y2 else "disabled")
+
+        def begin(event):
+            nonlocal start
+            start = (left + event.x // zoom, top + event.y // zoom)
+            drag(event)
+
+        def save():
+            try:
+                self.skull_reference = make_skull_reference(image, score, selection)
+            except ValueError as error:
+                messagebox.showerror("QuickClip", str(error), parent=zone.winfo_toplevel())
+                return
+            self.save_settings()
+            clear_button.configure(state="normal")
+            render_details()
+
+        def clear():
+            self.skull_reference = None
+            self.save_settings()
+            clear_button.configure(state="disabled")
+            render_details()
+
+        canvas.bind("<Button-1>", begin)
+        canvas.bind("<B1-Motion>", drag)
+        canvas.bind("<ButtonRelease-1>", drag)
+        save_button = ttk.Button(controls, text="Save skull reference", command=save, state="disabled")
+        save_button.pack(side="left")
+        clear_button = ttk.Button(controls, text="Clear reference", command=clear,
+                                  state="normal" if self.skull_reference else "disabled")
+        clear_button.pack(side="left", padx=(6, 0))
 
     def show_feed_results(self):
         lines = []
@@ -838,6 +921,7 @@ class Desktop:
                     region=parse_feed_region(self.feed_region.get()) if player else FEED,
                     any_mention=self.any_feed_mention.get(), fallback_track=fallback,
                     threshold=threshold, mode=self.feed_mode.get(), badge=badge,
+                    skull_reference=self.skull_reference,
                     divider=parse_feed_divider(self.feed_divider.get())
                     if player and self.fixed_feed_divider.get() else None,
                 )

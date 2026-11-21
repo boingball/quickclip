@@ -173,6 +173,7 @@ OCR_MODES = ("Grayscale", "Bright text", "Colored HUD", GREEN_PLAYER, FAINT_TEXT
 KILL_BADGE_MODE = OCR_MODES[0]
 KILL_BADGE_PAGE_MODE = "11"
 KILL_BADGE_TEXT_LUT = bytes(0 if value >= 175 else 255 for value in range(256))
+SKULL_SAMPLE_SIZE = 12
 OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored", "green", "faint"), OCR_MODES))
 OCR_WIDTH, OCR_HEIGHT = 960, 480
 OCR_HEADER = f"P5\n{OCR_WIDTH} {OCR_HEIGHT}\n255\n".encode("ascii")
@@ -237,6 +238,21 @@ class OCRRow:
 
 
 @dataclass(frozen=True)
+class SkullReference:
+    box: tuple[float, float, float, float]
+    pixels: tuple[int, ...]
+
+    def __post_init__(self):
+        if (len(self.box) != 4 or not all(isinstance(value, (int, float)) and math.isfinite(value)
+                                          for value in self.box)
+                or not (-3.1 <= self.box[0] <= 0 and -.6 <= self.box[1] <= 1.6)
+                or not all(.3 <= size <= 2.5 for size in self.box[2:])
+                or len(self.pixels) != SKULL_SAMPLE_SIZE ** 2
+                or not all(type(value) is int and 0 <= value <= 255 for value in self.pixels)):
+            raise ValueError("Invalid skull reference.")
+
+
+@dataclass(frozen=True)
 class KillFeedOptions:
     region: tuple[float, float, float, float] = FEED
     any_mention: bool = False
@@ -245,6 +261,7 @@ class KillFeedOptions:
     mode: str = OCR_MODES[0]
     divider: float | None = None
     badge: bool = False
+    skull_reference: SkullReference | None = None
 
 
 def parse_feed_region(text):
@@ -457,6 +474,72 @@ def skull_search_area(score):
     return left, top, right, bottom
 
 
+def skull_search_preview(frame, score):
+    left, top, right, bottom = skull_search_area(score)
+    if right <= left or bottom <= top:
+        return None
+    header = f"P5\n{right - left} {bottom - top}\n255\n".encode("ascii")
+    rows = []
+    for y in range(top, bottom):
+        offset = len(OCR_HEADER) + y * OCR_WIDTH
+        rows.append(frame[offset + left:offset + right])
+    return header + b"".join(rows)
+
+
+def sample_skull(frame, left, top, width, height):
+    if left < 0 or top < 0 or left + width > OCR_WIDTH or top + height > OCR_HEIGHT:
+        return ()
+    columns = [left + width * (2 * x + 1) // (2 * SKULL_SAMPLE_SIZE)
+               for x in range(SKULL_SAMPLE_SIZE)]
+    offsets = [len(OCR_HEADER) + OCR_WIDTH * (top + height * (2 * y + 1) // (2 * SKULL_SAMPLE_SIZE))
+               for y in range(SKULL_SAMPLE_SIZE)]
+    return tuple(frame[offset + x] for offset in offsets for x in columns)
+
+
+def normalize_skull(pixels):
+    if not pixels:
+        return ()
+    mean = sum(pixels) / len(pixels)
+    centered = [pixel - mean for pixel in pixels]
+    length = math.sqrt(sum(pixel ** 2 for pixel in centered))
+    if length < 5 * math.sqrt(len(pixels)):
+        return ()
+    return tuple(pixel / length for pixel in centered)
+
+
+def make_skull_reference(frame, score, bounds):
+    left, top, right, bottom = bounds
+    search_left, search_top, search_right, search_bottom = skull_search_area(score)
+    width, height = right - left, bottom - top
+    if not (search_left <= left < right <= search_right and search_top <= top < bottom <= search_bottom
+            and width >= .3 * score.height and height >= .3 * score.height):
+        raise ValueError("Draw a tight box around the whole skull inside the zoomed area.")
+    pixels = sample_skull(frame, left, top, width, height)
+    if not normalize_skull(pixels):
+        raise ValueError("That selection has too little contrast. Include the outline and eye sockets.")
+    box = tuple(value / score.height for value in (left - score.left, top - score.top, width, height))
+    return SkullReference(box, pixels)
+
+
+def matches_skull_reference(frame, score, reference):
+    template = normalize_skull(reference.pixels)
+    if not template:
+        return False
+    x, y, width, height = (round(value * score.height) for value in reference.box)
+    step = max(1, score.height // 12)
+    shifts = (0, -step, step, -2 * step, 2 * step)
+    for scale in (1, .9, 1.1):
+        w, h = max(1, round(width * scale)), max(1, round(height * scale))
+        left = score.left + x + (width - w) // 2
+        top = score.top + y + (height - h) // 2
+        for dx in shifts:
+            for dy in shifts:
+                pixels = normalize_skull(sample_skull(frame, left + dx, top + dy, w, h))
+                if sum(expected * actual for expected, actual in zip(template, pixels)) >= .87:
+                    return True
+    return False
+
+
 def skull_next_to_score(frame, score):
     left, top, right, bottom = skull_search_area(score)
     samples = [
@@ -479,12 +562,14 @@ def badge_scores(rows):
             and re.fullmatch(r"[0-9]{2,4}", word.text)]
 
 
-def kill_badge_match(frame, rows):
+def kill_badge_match(frame, rows, reference=None):
     if any(KILL_BADGE_PATTERN.search(row.text) for row in rows):
         return "boxed KILL text"
     if any(re.search(r"\bKILL\s+ASSIST\b", row.text, re.IGNORECASE) for row in rows):
         return None
     for word in badge_scores(rows):
+        if reference is not None and matches_skull_reference(frame, word, reference):
+            return f"saved skull beside score {word.text}"
         if skull_next_to_score(frame, word):
             return f"skull beside score {word.text}"
     return None
@@ -634,7 +719,7 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
             diagnostics.badge_samples = 0
 
         def badge_matches(rows, frame):
-            if kill_badge_match(frame, rows):
+            if kill_badge_match(frame, rows, feed.skull_reference):
                 if diagnostics is not None:
                     diagnostics.badge_samples += 1
                 return {"KILL"}
