@@ -102,3 +102,11 @@ Use `--show-feed` to show OCR rows and `--feed-region 58,0,42,30` to set the cro
 For a badge-only montage, pass `--kill-montage --kill-badge --output "F:\QuickClip-Montage"`. Add `--player boingball` to scan both cues.
 
 If all audio tracks play late in an exported clip, try `--audio-offset-ms -1000` to bring them one second earlier. The desktop app has the same **Export audio offset (ms)** setting. Positive values delay audio. The offset applies to all tracks during export and defaults to zero.
+
+## Radeon acceleration on Windows
+
+Enable **Radeon hardware encoding** to try FFmpeg's AMD AMF H.264 encoder (`h264_amf`) for clips and montages. Enable **Radeon hardware decoding** to try D3D11VA on an AMD adapter when reading video for scans or exports. The two settings work independently. Tesseract OCR still runs on the CPU.
+
+Use an FFmpeg build that lists `h264_amf` in `ffmpeg -encoders` and `d3d11va` in `ffmpeg -hwaccels`, with your Radeon driver installed. QuickClip falls back to CPU processing if a feature is missing or the hardware attempt fails.
+
+The command-line equivalents are `--radeon-encode` and `--radeon-decode`.

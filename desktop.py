@@ -18,8 +18,9 @@ from tkinter import filedialog, messagebox, ttk
 from quickclip import (
     BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, FEED, GREEN_PLAYER, KillFeedOptions, NAME_TOKEN, OCR_MODES,
     RECORDING_EXTENSIONS, export_clip, folder_recordings, parse_feed_divider, parse_feed_region, prepare_output,
-    SkullReference, badge_scores, kill_badge_match, make_skull_reference, preview_feed, preview_kill_badge,
-    probe, process_batch, run, scan_kills, skull_search_area, skull_search_preview, write_montage,
+    SkullReference, VideoAcceleration, badge_scores, kill_badge_match, make_skull_reference, preview_feed,
+    preview_kill_badge, probe, process_batch, resolve_video_acceleration, run, scan_kills,
+    skull_search_area, skull_search_preview, write_montage,
 )
 
 MONTAGE_CUES = ("Kill feed", "KILL badge", "Both")
@@ -99,6 +100,8 @@ class Desktop:
         self.any_feed_mention = tk.BooleanVar()
         self.audio_fallback = tk.BooleanVar()
         self.montage_cue = tk.StringVar(value=MONTAGE_CUES[0])
+        self.radeon_encode = tk.BooleanVar()
+        self.radeon_decode = tk.BooleanVar()
         self.skull_reference = None
 
         root.title("QuickClip")
@@ -167,6 +170,10 @@ class Desktop:
         ttk.Label(settings, text="Montage cues").grid(row=8, column=0, sticky="w")
         ttk.Combobox(settings, textvariable=self.montage_cue, values=MONTAGE_CUES,
                      state="readonly").grid(row=8, column=1, sticky="ew", padx=(0, 12), pady=3)
+        ttk.Checkbutton(settings, text="Radeon hardware encoding", variable=self.radeon_encode).grid(
+            row=9, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(settings, text="Radeon hardware decoding", variable=self.radeon_decode).grid(
+            row=9, column=2, columnspan=2, sticky="w")
 
         results = ttk.Frame(body)
         results.pack(fill="both", expand=True)
@@ -236,6 +243,8 @@ class Desktop:
         self.any_feed_mention.set(values.get("any_feed_mention") is True)
         self.audio_fallback.set(values.get("audio_fallback") is True)
         self.fixed_feed_divider.set(values.get("fixed_feed_divider") is True)
+        self.radeon_encode.set(values.get("radeon_encode") is True)
+        self.radeon_decode.set(values.get("radeon_decode") is True)
         if values.get("feed_mode") in OCR_MODES:
             self.feed_mode.set(values["feed_mode"])
         if values.get("montage_cue") in MONTAGE_CUES:
@@ -260,7 +269,8 @@ class Desktop:
                       score_enabled=self.score_enabled.get(), feed_region=self.feed_region.get(),
                       any_feed_mention=self.any_feed_mention.get(), audio_fallback=self.audio_fallback.get(),
                       feed_mode=self.feed_mode.get(), feed_divider=self.feed_divider.get(),
-                      fixed_feed_divider=self.fixed_feed_divider.get(), montage_cue=self.montage_cue.get())
+                      fixed_feed_divider=self.fixed_feed_divider.get(), montage_cue=self.montage_cue.get(),
+                      radeon_encode=self.radeon_encode.get(), radeon_decode=self.radeon_decode.get())
         if self.skull_reference is not None:
             values["skull_reference"] = asdict(self.skull_reference)
         temp = None
@@ -899,6 +909,7 @@ class Desktop:
     def start_scan(self, auto_export=False, montage=False):
         player = self.player.get().strip()
         sources = self.sources
+        requested = VideoAcceleration(auto_export and self.radeon_encode.get(), self.radeon_decode.get())
         try:
             before, after = float(self.before.get()), float(self.after.get())
             audio_offset = self.read_audio_offset() if auto_export else 0
@@ -993,14 +1004,17 @@ class Desktop:
             self.messages.put(("progress", message))
 
         def operation():
+            acceleration = resolve_video_acceleration(requested, progress)
             if montage:
                 results = []
                 for result in scan_kills(sources, player, before, after, progress,
-                                         workers=workers, stop=self.scan_stop, feed=feed):
+                                         workers=workers, stop=self.scan_stop, feed=feed,
+                                         acceleration=acceleration):
                     results.append(result)
                     self.messages.put(("montage_result", result))
                 return results
-            return list(process_batch(sources, options, output, progress, audio_offset_ms=audio_offset))
+            return list(process_batch(sources, options, output, progress, audio_offset_ms=audio_offset,
+                                      acceleration=acceleration))
 
         self.status.set("Scanning recordings…")
         self.work(operation, complete)
@@ -1032,11 +1046,15 @@ class Desktop:
         clips = [self.clips[index] for index in sorted(self.kept)]
         candidates = [BatchResult(source, [clip for _, clip in group], [], [])
                       for source, group in groupby(clips, key=lambda item: item[0])]
+        requested = VideoAcceleration(self.radeon_encode.get(), self.radeon_decode.get())
 
         def operation():
-            return write_montage(self.sources, candidates, directory,
-                                  lambda msg: self.messages.put(("progress", msg)),
-                                  audio_offset_ms=audio_offset)
+            def progress(message):
+                self.messages.put(("progress", message))
+
+            acceleration = resolve_video_acceleration(requested, progress)
+            return write_montage(self.sources, candidates, directory, progress,
+                                 audio_offset_ms=audio_offset, acceleration=acceleration)
 
         def complete(value):
             results, path = value
@@ -1094,15 +1112,19 @@ class Desktop:
         if directory is None:
             return
         self.save_settings()
+        requested = VideoAcceleration(self.radeon_encode.get(), self.radeon_decode.get())
 
         def operation():
+            def progress(message):
+                self.messages.put(("progress", message))
+
+            acceleration = resolve_video_acceleration(requested, progress)
             if self.default_output is not None:
                 prepare_output(self.sources, directory)
             for index, (source, clip) in enumerate(clips, 1):
-                self.messages.put(("progress", f"Exporting clip {index} of {len(clips)}…"))
-                export_clip(source, clip, directory,
-                            progress=lambda msg: self.messages.put(("progress", msg)),
-                            audio_offset_ms=audio_offset)
+                progress(f"Exporting clip {index} of {len(clips)}…")
+                export_clip(source, clip, directory, progress=progress,
+                            audio_offset_ms=audio_offset, acceleration=acceleration)
             return len(clips)
 
         self.work(operation, lambda count: self.status.set(f"Exported {count} clip(s) to {directory}"))

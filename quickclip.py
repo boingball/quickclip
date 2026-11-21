@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, nullcontext
 import csv
 from dataclasses import dataclass, field
+from functools import lru_cache
+from itertools import islice
 import json
 import math
 import os
@@ -30,6 +32,12 @@ class Clip:
     start: float
     end: float
     reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class VideoAcceleration:
+    encode: bool = False
+    decode: bool = False
 
 
 @dataclass
@@ -57,6 +65,8 @@ class BatchResult:
 RECORDING_EXTENSIONS = (".mkv", ".mp4", ".mov", ".ts", ".flv", ".webm")
 DEFAULT_MONTAGE_WORKERS = min(4, os.cpu_count() or 1)
 BACKGROUND = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
+RADEON_DECODE_ARGS = ["-xerror", "-init_hw_device", "d3d11va=radeon:,vendor_id=0x1002",
+                      "-hwaccel", "d3d11va", "-hwaccel_device", "radeon"]
 
 
 def run(command, **kwargs):
@@ -65,6 +75,26 @@ def run(command, **kwargs):
         raise RuntimeError(result.stderr.decode(errors="replace").strip() or
                            f"{command[0]} exited with status {result.returncode}")
     return result.stdout
+
+
+@lru_cache(maxsize=8)
+def ffmpeg_features(executable, listing):
+    return run([executable, "-hide_banner", listing]).decode(errors="replace").split()
+
+
+def resolve_video_acceleration(requested, progress=print):
+    if not (requested.encode or requested.decode):
+        return requested
+    executable = shutil.which("ffmpeg")
+    if executable is None:
+        raise RuntimeError("Install ffmpeg and add it to PATH.")
+    encode = requested.encode and "h264_amf" in ffmpeg_features(executable, "-encoders")
+    decode = requested.decode and "d3d11va" in ffmpeg_features(executable, "-hwaccels")
+    if requested.encode and not encode:
+        progress("This FFmpeg build lacks h264_amf. Using CPU encoding.")
+    if requested.decode and not decode:
+        progress("This FFmpeg build lacks D3D11VA. Using CPU decoding.")
+    return VideoAcceleration(encode, decode)
 
 
 def probe(path):
@@ -99,6 +129,25 @@ def blocks(command, size):
             finally:
                 if process.poll() is None:
                     process.kill()
+
+
+def video_blocks(command, size, hardware_decode, progress):
+    completed = 0
+    if hardware_decode:
+        progress("Decoding video with Radeon D3D11VA…")
+        try:
+            with closing(blocks(command[:1] + RADEON_DECODE_ARGS + command[1:], size)) as frames:
+                for data in frames:
+                    if len(data) != size:
+                        raise RuntimeError("Radeon decoder returned a partial frame.")
+                    completed += 1
+                    yield data
+            return
+        except RuntimeError:
+            progress("Radeon decoding failed. Continuing with CPU decoding.")
+    with closing(blocks(command, size)) as frames:
+        yield from islice(frames, completed, None)
+
 
 
 def decode(path, *input_options):
@@ -579,7 +628,8 @@ def kill_badge_match(frame, rows, reference=None):
 
 
 def ocr_events(path, region, reason, identify, duration, progress, *,
-               page_mode="11", stop=None, mode=OCR_MODES[0], for_ocr=None, rounding="near"):
+               page_mode="11", stop=None, mode=OCR_MODES[0], for_ocr=None, rounding="near",
+               hardware_decode=False):
     filters = f"fps=2:start_time=0:round={rounding}," + ocr_filter(region, mode)
     command = decode(path, "-filter_threads", "1", "-threads:v", "1")
     command += ["-map", "0:V:0", "-an", "-vf", filters, "-threads:v", "1",
@@ -587,7 +637,7 @@ def ocr_events(path, region, reason, identify, duration, progress, *,
     tesseract_env = {**os.environ, "OMP_THREAD_LIMIT": "1"}
     recent = deque(maxlen=3)
     last_frame = None
-    with closing(blocks(command, OCR_WIDTH * OCR_HEIGHT)) as frames:
+    with closing(video_blocks(command, OCR_WIDTH * OCR_HEIGHT, hardware_decode, progress)) as frames:
         for index, data in enumerate(frames):
             if stop is not None and stop.is_set():
                 return
@@ -641,7 +691,7 @@ def validate_detection(track, threshold, player, score, before, after, *, badge=
 
 
 def scan(path, recording, track, threshold, player, score, before, after, progress=print,
-         *, feed=None, diagnostics=None, stop=None):
+         *, feed=None, diagnostics=None, stop=None, acceleration=VideoAcceleration()):
     badge = feed is not None and feed.badge
     player, score_pattern = validate_detection(track, threshold, player, score, before, after, badge=badge)
     levels = None
@@ -716,7 +766,8 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
 
         events.extend(ocr_events(path, feed.region if feed else FEED, "Kill feed", feed_matches,
                                  recording.duration, progress, page_mode="6" if feed else "11",
-                                 stop=stop, mode=feed.mode if feed else OCR_MODES[0]))
+                                 stop=stop, mode=feed.mode if feed else OCR_MODES[0],
+                                 hardware_decode=acceleration.decode))
     if badge:
         if diagnostics is not None:
             diagnostics.badge_samples = 0
@@ -733,14 +784,15 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         # Use the last source frame at or before each half-second sample.
         events.extend(ocr_events(path, KILL_BADGE_REGION, "KILL badge", badge_matches,
                                  recording.duration, progress, page_mode=KILL_BADGE_PAGE_MODE,
-                                 stop=stop, mode=KILL_BADGE_MODE, for_ocr=badge_text_frame, rounding="up"))
+                                 stop=stop, mode=KILL_BADGE_MODE, for_ocr=badge_text_frame, rounding="up",
+                                 hardware_decode=acceleration.decode))
     if score_pattern:
         def score_matches(rows, _frame):
             text = "\n".join(row.text for row in rows)
             return {"".join(match.group().upper().split()) for match in score_pattern.finditer(text)}
 
         events.extend(ocr_events(path, SCORE, "Score popup", score_matches,
-                                 recording.duration, progress))
+                                 recording.duration, progress, hardware_decode=acceleration.decode))
     return find_clips(events, recording.duration, before, after)
 
 
@@ -764,7 +816,8 @@ def loud_fallback(source, recording, feed, before, after, progress, stop):
                           recording.duration, before, after)
 
 
-def export_clip(source, clip, directory, progress=print, *, audio_offset_ms=0):
+def export_clip(source, clip, directory, progress=print, *, audio_offset_ms=0,
+                acceleration=VideoAcceleration()):
     directory.mkdir(parents=True, exist_ok=True)
     stem = f"{source.stem}_{round(clip.start * 1000):09d}_{round(clip.end * 1000):09d}"
     with tempfile.TemporaryDirectory(prefix=".quickclip-", dir=directory) as temp:
@@ -781,12 +834,41 @@ def export_clip(source, clip, directory, progress=print, *, audio_offset_ms=0):
                    "-map", "0:V:0", "-map", "0:a?", "-map_chapters", "-1",
                    # Preserve the recording's frame cadence and audio timestamp gaps.
                    "-fps_mode", "passthrough", "-af", audio_filter,
-                   "-c:v", "libx264", "-crf", "18", "-c:a", "flac"]
-        encode_x264(command, streams, encoded, progress)
+                   "-c:a", "flac"]
+        encode_video(command, streams, encoded, progress, acceleration)
         return publish_export(encoded, directory, stem)
 
 
+def encode_video(command, streams, encoded, progress, acceleration):
+    radeon = command[:1] + RADEON_DECODE_ARGS + command[1:]
+    if acceleration.encode:
+        amf = ["-c:v", "h264_amf", "-pix_fmt", "nv12", "-usage", "transcoding", "-quality", "quality",
+               "-rc", "cqp", "-qp_i", "18", "-qp_p", "20", "-qp_b", "22"]
+        plans = [(radeon, "Radeon decoding and AMF encoding")] if acceleration.decode else []
+        plans.append((command, "CPU decoding and Radeon AMF encoding"))
+        for options, description in plans:
+            progress(f"Trying {description}…")
+            try:
+                run(options + ["-threads:v", "2"] + streams + amf + [str(encoded)])
+                return
+            except RuntimeError as error:
+                encoded.unlink(missing_ok=True)
+                detail = str(error).partition("\n")[0]
+                progress(f"{description} failed. {detail}")
+        progress("Using CPU encoding for this clip.")
+    if acceleration.decode:
+        progress("Trying Radeon decoding with CPU encoding…")
+        try:
+            encode_x264(radeon, streams, encoded, progress)
+            return
+        except RuntimeError:
+            encoded.unlink(missing_ok=True)
+            progress("Radeon decoding failed for this export. Retrying with CPU decoding.")
+    encode_x264(command, streams, encoded, progress)
+
+
 def encode_x264(command, streams, encoded, progress):
+    streams = streams + ["-c:v", "libx264", "-crf", "18"]
     try:
         run(command + ["-threads:v", "2"] + streams
             + ["-threads:v", "2", "-preset", "fast", "-x264-params",
@@ -841,7 +923,7 @@ def validate_batch(options, *, badge=False):
             raise RuntimeError(f"Install {program} and add it to PATH.")
 
 
-def scan_recording(source, options, progress, *, feed=None, stop=None):
+def scan_recording(source, options, progress, *, feed=None, stop=None, acceleration=VideoAcceleration()):
     result = BatchResult(source, [], [], [])
     if stop is not None and stop.is_set():
         return result
@@ -849,7 +931,7 @@ def scan_recording(source, options, progress, *, feed=None, stop=None):
     try:
         recording = probe(source)
         result.clips = scan(source, recording, *options, progress=progress, feed=feed,
-                            diagnostics=result if feed else None, stop=stop)
+                            diagnostics=result if feed else None, stop=stop, acceleration=acceleration)
         if feed and feed.fallback_track and not result.clips:
             result.clips = loud_fallback(source, recording, feed, *options[-2:], progress, stop)
     except (OSError, RuntimeError, ValueError) as error:
@@ -857,7 +939,8 @@ def scan_recording(source, options, progress, *, feed=None, stop=None):
     return result
 
 
-def process_batch(sources, options, output=None, progress=print, *, audio_offset_ms=0):
+def process_batch(sources, options, output=None, progress=print, *, audio_offset_ms=0,
+                  acceleration=VideoAcceleration()):
     validate_batch(options)
     if output is not None:
         prepare_output(sources, output)
@@ -868,18 +951,18 @@ def process_batch(sources, options, output=None, progress=print, *, audio_offset
         def report(message):
             progress(f"{prefix} · {message}")
 
-        result = scan_recording(source, options, report)
+        result = scan_recording(source, options, report, acceleration=acceleration)
         if output is not None:
-            export_candidates(result, output, report, audio_offset_ms)
+            export_candidates(result, output, report, audio_offset_ms, acceleration)
         yield result
 
 
-def export_candidates(result, output, progress, audio_offset_ms):
+def export_candidates(result, output, progress, audio_offset_ms, acceleration):
     for count, clip in enumerate(result.clips, 1):
         progress(f"Exporting clip {count}/{len(result.clips)} ({clip.start:.2f}–{clip.end:.2f}s)")
         try:
             result.exports.append(export_clip(result.source, clip, output, progress=progress,
-                                              audio_offset_ms=audio_offset_ms))
+                                              audio_offset_ms=audio_offset_ms, acceleration=acceleration))
         except (OSError, RuntimeError) as error:
             result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
 
@@ -964,7 +1047,7 @@ def montage_audio_settings(segments, reference):
     return settings, orders
 
 
-def normalize_montage_segment(path, width, height, audio, order, progress):
+def normalize_montage_segment(path, width, height, audio, order, progress, acceleration):
     converted = path.with_name("converted-" + path.name)
     duration = probe(path).duration
     command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-filter_threads", "1"]
@@ -984,14 +1067,14 @@ def normalize_montage_segment(path, width, height, audio, order, progress):
     filters = (f"scale=w='max(2,trunc(min({width},{height}*dar)/2)*2)':"
                f"h='max(2,trunc(min({height},{width}/dar)/2)*2)',"
                f"setsar=1,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p")
-    streams += ["-vf", filters, "-fps_mode", "passthrough", "-c:v", "libx264", "-crf", "18",
-                "-c:a", "flac", "-sample_fmt:a", "s32"]
-    encode_x264(command, streams, converted, progress)
+    streams += ["-vf", filters, "-fps_mode", "passthrough", "-c:a", "flac", "-sample_fmt:a", "s32"]
+    encode_video(command, streams, converted, progress, acceleration)
     converted.replace(path)
 
 
 def scan_kills(sources, player, before, after, progress=print, *,
-               workers=DEFAULT_MONTAGE_WORKERS, stop=None, feed=KillFeedOptions()):
+               workers=DEFAULT_MONTAGE_WORKERS, stop=None, feed=KillFeedOptions(),
+               acceleration=VideoAcceleration()):
     if not player.strip() and not feed.badge:
         raise ValueError("Enter your player name to make a kill montage.")
     if workers < 1:
@@ -1007,7 +1090,7 @@ def scan_kills(sources, player, before, after, progress=print, *,
         def report(message):
             progress(f"[{index}/{len(sources)}] {source.name} · {message}")
 
-        return scan_recording(source, options, report, feed=feed, stop=stop)
+        return scan_recording(source, options, report, feed=feed, stop=stop, acceleration=acceleration)
 
     pool = ThreadPoolExecutor(max_workers=min(workers, len(sources)))
     try:
@@ -1021,7 +1104,8 @@ def scan_kills(sources, player, before, after, progress=print, *,
         pool.shutdown(cancel_futures=True)
 
 
-def write_montage(sources, candidates, output, progress=print, *, audio_offset_ms=0):
+def write_montage(sources, candidates, output, progress=print, *, audio_offset_ms=0,
+                  acceleration=VideoAcceleration()):
     prepare_output(sources, output)
     source_order = {source: index for index, source in enumerate(sources)}
     with tempfile.TemporaryDirectory(prefix=".quickclip-montage-", dir=output) as temp:
@@ -1032,7 +1116,7 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
             results.append(result)
             if result.clips:
                 progress(f"{result.source.name} · Preparing montage clips")
-                export_candidates(result, staging, progress, audio_offset_ms)
+                export_candidates(result, staging, progress, audio_offset_ms, acceleration)
             for segment in tuple(result.exports):
                 try:
                     layout = montage_layout(segment)
@@ -1062,7 +1146,7 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
             try:
                 if mixed:
                     progress(f"Converting clip {index}/{len(segments)} · {segment.result.source.name}")
-                    normalize_montage_segment(segment.path, width, height, audio, order, progress)
+                    normalize_montage_segment(segment.path, width, height, audio, order, progress, acceleration)
                 else:
                     pad_montage_audio(segment.path, segment.layout, expected)
             except (OSError, RuntimeError, ValueError) as error:
@@ -1087,10 +1171,12 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
 
 
 def kill_montage(sources, player, before, after, output, progress=print, *,
-                 audio_offset_ms=0, workers=DEFAULT_MONTAGE_WORKERS, feed=KillFeedOptions()):
+                 audio_offset_ms=0, workers=DEFAULT_MONTAGE_WORKERS, feed=KillFeedOptions(),
+                 acceleration=VideoAcceleration()):
     with closing(scan_kills(sources, player, before, after, progress, workers=workers,
-                            feed=feed)) as candidates:
-        return write_montage(sources, candidates, output, progress, audio_offset_ms=audio_offset_ms)
+                            feed=feed, acceleration=acceleration)) as candidates:
+        return write_montage(sources, candidates, output, progress, audio_offset_ms=audio_offset_ms,
+                             acceleration=acceleration)
 
 
 def parse_mic_track(value):
@@ -1136,6 +1222,10 @@ def main():
                         help="Print the most common OCR rows from each montage recording.")
     parser.add_argument("--audio-offset-ms", type=int, default=0,
                         help="Shift all exported audio tracks. Negative brings audio earlier; positive delays it.")
+    parser.add_argument("--radeon-encode", action="store_true",
+                        help="Try AMD AMF hardware encoding for exports.")
+    parser.add_argument("--radeon-decode", action="store_true",
+                        help="Try Radeon D3D11VA decoding for OCR and exports on Windows.")
     args = parser.parse_args()
     is_folder = args.recording is not None and args.recording.is_dir()
     if args.files is not None and (args.files < 1 or not is_folder):
@@ -1145,6 +1235,7 @@ def main():
         launch()
         return
     try:
+        acceleration = resolve_video_acceleration(VideoAcceleration(args.radeon_encode, args.radeon_decode))
         sources = folder_recordings(args.recording) if is_folder else [args.recording]
         if args.files is not None:
             sources = sources[:args.files]
@@ -1163,7 +1254,7 @@ def main():
                                    args.kill_badge)
             results, montage = kill_montage(sources, args.player, before, after, args.output,
                                             audio_offset_ms=args.audio_offset_ms, workers=args.workers,
-                                            feed=feed)
+                                            feed=feed, acceleration=acceleration)
             for result in results:
                 if args.show_feed and result.badge_samples is not None:
                     print(f"{result.source.name}: KILL badge seen in {result.badge_samples} sample(s).")
@@ -1198,7 +1289,8 @@ def main():
             failed = 0
             candidates = 0
             exported = 0
-            for result in process_batch(sources, options, args.output, audio_offset_ms=args.audio_offset_ms):
+            for result in process_batch(sources, options, args.output, audio_offset_ms=args.audio_offset_ms,
+                                        acceleration=acceleration):
                 candidates += len(result.clips)
                 exported += len(result.exports)
                 failed += bool(result.errors)
@@ -1216,11 +1308,12 @@ def main():
         info = probe(args.recording)
         for index, track in enumerate(info.audio, 1):
             print(f"Audio track {index}: {track}")
-        clips = scan(args.recording, info, *options)
+        clips = scan(args.recording, info, *options, acceleration=acceleration)
         for clip in clips:
             print(f"{clip.start:.2f}–{clip.end:.2f}s  {', '.join(clip.reasons)}")
             if args.output is not None:
-                print(export_clip(args.recording, clip, args.output, audio_offset_ms=args.audio_offset_ms))
+                print(export_clip(args.recording, clip, args.output, audio_offset_ms=args.audio_offset_ms,
+                                  acceleration=acceleration))
         print(f"{len(clips)} highlight candidate(s).")
     except (OSError, RuntimeError, ValueError, re.error) as error:
         parser.exit(1, f"QuickClip: {error}\n")
