@@ -22,6 +22,7 @@ from quickclip import (
     make_skull_reference, preview_feed, preview_kill_badge, probe, process_batch, resolve_video_acceleration,
     resume_montage_job, run, save_montage_job, scan_kills, skull_search_area, skull_search_preview,
 )
+from scan_review import SavedScan
 
 MONTAGE_CUES = ("Kill feed", "KILL badge", "Both")
 
@@ -81,6 +82,10 @@ class Desktop:
         self.scan_stop = None
         self.montage_pause = None
         self.close_after_montage = False
+        self.reviewing_saved_scan = False
+        self.review_warning_shown = False
+        self.shutdown_task = None
+        self.can_shutdown = os.name == "nt"
         self.completed_files = 0
         self.scan_total = 0
         self.feed_results = []
@@ -104,6 +109,7 @@ class Desktop:
         self.montage_cue = tk.StringVar(value=MONTAGE_CUES[0])
         self.radeon_encode = tk.BooleanVar()
         self.radeon_decode = tk.BooleanVar()
+        self.shutdown_when_finished = tk.BooleanVar()
         self.skull_reference = None
 
         root.title("QuickClip")
@@ -176,6 +182,12 @@ class Desktop:
             row=9, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(settings, text="Radeon hardware decoding", variable=self.radeon_decode).grid(
             row=9, column=2, columnspan=2, sticky="w")
+        shutdown = ttk.Checkbutton(settings, text="Shut down PC after montage", variable=self.shutdown_when_finished)
+        shutdown.grid(row=10, column=0, columnspan=2, sticky="w")
+        if not self.can_shutdown:
+            shutdown.state(["disabled"])
+        self.resume_scan_button = ttk.Button(settings, text="Resume replay scan", command=self.resume_saved_scan)
+        self.resume_scan_button.grid(row=10, column=3, sticky="e")
 
         results = ttk.Frame(body)
         results.pack(fill="both", expand=True)
@@ -209,10 +221,13 @@ class Desktop:
         self.export_button.pack(side="right")
         self.build_button = ttk.Button(actions, text="Build montage", command=self.build_montage)
         self.pause_button = ttk.Button(actions, text="Pause montage", command=self.pause_montage)
+        self.cancel_shutdown_button = ttk.Button(actions, text="Cancel shutdown", command=self.cancel_shutdown)
         ttk.Label(body, textvariable=self.status, wraplength=680).pack(fill="x", pady=(10, 0))
 
         self.busy = False
         self.settings_file = settings_path()
+        self.review_directory = self.settings_file.parent / "scan-review"
+        self.saved_scan = SavedScan.load(self.review_directory)
         self.settings_warning_shown = False
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.load_settings()
@@ -301,6 +316,12 @@ class Desktop:
             self.close_after_montage = True
             self.pause_montage()
             return
+        if self.montage_scanning and self.scan_stop is not None:
+            self.close_after_montage = True
+            self.scan_stop.set()
+            self.status.set("Saving replay scan and closing…")
+            return
+        self.cancel_shutdown(quiet=True)
         self.stop_feed_playback()
         if self.scan_stop is not None:
             self.scan_stop.set()
@@ -325,6 +346,12 @@ class Desktop:
         self.build_button.configure(state="normal" if self.kept and not self.busy else "disabled")
         directory = self.output or self.default_output
         self.resume_button.configure(state="normal" if not self.busy and latest_montage_job(directory) else "disabled")
+        saved = self.saved_scan
+        has_pending = saved is not None and bool(saved.pending())
+        can_restore = saved is not None and self.input_path == saved.input_path and (
+            has_pending or not self.reviewing_saved_scan)
+        self.resume_scan_button.configure(text="Resume replay scan" if has_pending else "Restore replay review",
+                                          state="normal" if can_restore and not self.busy else "disabled")
         if self.montage_pause is not None:
             self.pause_button.pack(side="right", padx=(0, 6))
             self.pause_button.configure(state="disabled" if self.montage_pause.is_set() else "normal")
@@ -333,6 +360,7 @@ class Desktop:
         self.preview_button.configure(state="normal" if can_preview and shutil.which("ffplay") else "disabled")
 
     def work(self, operation, complete):
+        self.cancel_shutdown(quiet=True)
         self.busy = True
         self.buttons()
 
@@ -358,18 +386,22 @@ class Desktop:
                     self.completed_files += 1
                     self.feed_results.append(value)
                     self.append_candidates(value)
+                    try:
+                        self.saved_scan.save_result(value)
+                    except OSError as error:
+                        self.warn_review_save(error)
                     self.update_keep_count()
                     self.buttons()
                     continue
                 self.busy = False
                 self.montage_pause = None
-                if self.close_after_montage:
-                    self.close()
-                    return
                 if self.montage_scanning:
                     self.montage_scanning = False
                     self.scan_stop = None
                     self.update_keep_count()
+                if self.close_after_montage:
+                    self.close()
+                    return
                 if kind == "paused":
                     self.status.set("Montage paused. Completed clips are saved. Click Resume montage to continue.")
                 elif kind == "error":
@@ -388,6 +420,7 @@ class Desktop:
         self.feed_results.clear()
         self.kept.clear()
         self.montage_review = montage
+        self.reviewing_saved_scan = False
         self.keep_count.set("")
         self.table.delete(*self.table.get_children())
         if montage:
@@ -429,6 +462,12 @@ class Desktop:
         else:
             self.kept.add(index)
         self.table.set(row, "keep", "☑" if index in self.kept else "☐")
+        if self.reviewing_saved_scan:
+            source, clip = self.clips[index]
+            try:
+                self.saved_scan.update_choice(source, clip, index in self.kept)
+            except (KeyError, OSError) as error:
+                self.warn_review_save(error)
         self.update_keep_count()
         self.buttons()
 
@@ -499,6 +538,8 @@ class Desktop:
         else:
             self.status.set(f"{clock(recording.duration)} · {len(recording.audio)} audio track(s). "
                             "Auto looks for the isolated mic track. You can also pick it manually.")
+        if self.saved_scan and self.saved_scan.input_path == self.input_path:
+            self.restore_replay_list()
 
     def show_output(self):
         directory = self.output or self.default_output
@@ -932,41 +973,74 @@ class Desktop:
             lines.append("")
         self.show_details("Montage OCR readout", "\n".join(lines))
 
-    def start_scan(self, auto_export=False, montage=False):
+    def warn_review_save(self, error):
+        if not self.review_warning_shown:
+            self.review_warning_shown = True
+            messagebox.showwarning("QuickClip", f"Could not save replay review progress. {error}")
+
+    def restore_replay_list(self):
+        saved = self.saved_scan
+        self.clear(montage=True)
+        self.reviewing_saved_scan = True
+        for source in saved.sources:
+            if source in saved.results:
+                result = saved.results[source]
+                self.feed_results.append(result)
+                self.append_candidates(result)
+        self.update_keep_count()
+        pending = len(saved.pending())
+        self.status.set(f"Restored {len(self.clips)} clip(s) from {len(saved.results)} replay(s). "
+                        f"{pending} replay(s) still to scan.")
+        self.buttons()
+
+    def resume_saved_scan(self):
+        if self.saved_scan is None or self.saved_scan.input_path != self.input_path:
+            return
+        if self.saved_scan.pending():
+            self.start_scan(montage=True, resume=True)
+        else:
+            self.restore_replay_list()
+
+    def start_scan(self, auto_export=False, montage=False, resume=False):
         player = self.player.get().strip()
         sources = self.sources
         requested = VideoAcceleration(auto_export and self.radeon_encode.get(), self.radeon_decode.get())
         try:
-            before, after = float(self.before.get()), float(self.after.get())
+            if resume:
+                saved = self.saved_scan
+                player, before, after, feed = saved.player, saved.before, saved.after, saved.feed
+            else:
+                before, after = float(self.before.get()), float(self.after.get())
             audio_offset = self.read_audio_offset() if auto_export else 0
             selection = self.track.current()
             track = "auto" if selection == 0 else selection - 1
             if montage:
-                cue = self.montage_cue.get()
-                badge = cue in MONTAGE_CUES[1:]
-                if cue == "KILL badge":
-                    player = ""
-                elif not player:
-                    raise ValueError("Enter your player name to make a kill montage.")
-                limit = self.montage_limit.get().strip()
-                if limit:
-                    if not limit.isascii() or not limit.isdecimal() or int(limit) < 1:
-                        raise ValueError("Enter a positive whole number for the montage file limit.")
-                    sources = sources[:int(limit)]
                 workers = self.montage_workers.get().strip()
                 if not workers.isascii() or not workers.isdecimal() or int(workers) < 1:
                     raise ValueError("Enter a positive whole number for the montage scan workers.")
                 workers = int(workers)
-                fallback = (track or "auto") if self.audio_fallback.get() else 0
-                threshold = float(self.threshold.get()) if fallback else -18
-                feed = KillFeedOptions(
-                    region=parse_feed_region(self.feed_region.get()) if player else FEED,
-                    any_mention=self.any_feed_mention.get(), fallback_track=fallback,
-                    threshold=threshold, mode=self.feed_mode.get(), badge=badge,
-                    skull_reference=self.skull_reference,
-                    divider=parse_feed_divider(self.feed_divider.get())
-                    if player and self.fixed_feed_divider.get() else None,
-                )
+                if not resume:
+                    cue = self.montage_cue.get()
+                    badge = cue in MONTAGE_CUES[1:]
+                    if cue == "KILL badge":
+                        player = ""
+                    elif not player:
+                        raise ValueError("Enter your player name to make a kill montage.")
+                    limit = self.montage_limit.get().strip()
+                    if limit:
+                        if not limit.isascii() or not limit.isdecimal() or int(limit) < 1:
+                            raise ValueError("Enter a positive whole number for the montage file limit.")
+                        sources = sources[:int(limit)]
+                    fallback = (track or "auto") if self.audio_fallback.get() else 0
+                    threshold = float(self.threshold.get()) if fallback else -18
+                    feed = KillFeedOptions(
+                        region=parse_feed_region(self.feed_region.get()) if player else FEED,
+                        any_mention=self.any_feed_mention.get(), fallback_track=fallback,
+                        threshold=threshold, mode=self.feed_mode.get(), badge=badge,
+                        skull_reference=self.skull_reference,
+                        divider=parse_feed_divider(self.feed_divider.get())
+                        if player and self.fixed_feed_divider.get() else None,
+                    )
             else:
                 score = self.score.get().strip() if self.score_enabled.get() else ""
                 if self.score_enabled.get() and not score:
@@ -984,15 +1058,25 @@ class Desktop:
         self.save_settings()
 
         if montage:
-            self.clear(montage=True)
+            if not resume:
+                try:
+                    self.saved_scan = SavedScan.create(self.review_directory, self.input_path, sources,
+                                                       player, before, after, feed)
+                except OSError as error:
+                    messagebox.showerror("QuickClip", f"Could not start saving replay review. {error}")
+                    return
+            self.restore_replay_list()
+            sources = self.saved_scan.pending()
             self.montage_scanning = True
             self.scan_stop = Event()
-            self.completed_files = 0
-            self.scan_total = len(sources)
+            self.completed_files = len(self.saved_scan.results)
+            self.scan_total = len(self.saved_scan.sources)
             self.update_keep_count()
 
         def complete(results):
-            if not montage:
+            if montage:
+                results = self.feed_results
+            else:
                 self.clear()
                 for result in results:
                     self.append_candidates(result)
@@ -1032,13 +1116,11 @@ class Desktop:
         def operation():
             acceleration = resolve_video_acceleration(requested, progress)
             if montage:
-                results = []
                 for result in scan_kills(sources, player, before, after, progress,
                                          workers=workers, stop=self.scan_stop, feed=feed,
                                          acceleration=acceleration):
-                    results.append(result)
                     self.messages.put(("montage_result", result))
-                return results
+                return None
             return list(process_batch(sources, options, output, progress, audio_offset_ms=audio_offset,
                                       acceleration=acceleration))
 
@@ -1047,13 +1129,15 @@ class Desktop:
 
     def append_candidates(self, result):
         first = len(self.clips)
-        for clip in result.clips:
+        rejected = self.saved_scan.rejections.get(result.source, ()) if self.reviewing_saved_scan else ()
+        for position, clip in enumerate(result.clips):
             index = len(self.clips)
             self.clips.append((result.source, clip))
-            if self.montage_review:
+            keep = self.montage_review and position not in rejected
+            if keep:
                 self.kept.add(index)
             self.table.insert("", "end", iid=str(index), values=(
-                "☑" if self.montage_review else "", result.source.name, clock(clip.start),
+                ("☑" if keep else "☐") if self.montage_review else "", result.source.name, clock(clip.start),
                 clock(clip.end), ", ".join(clip.reasons)))
         if self.montage_review and first == 0 and self.clips:
             self.table.selection_set("0")
@@ -1105,9 +1189,38 @@ class Desktop:
             self.status.set(f"Saved {count} clip(s) to {path}." if path else "No montage was created.")
             if failures:
                 self.show_failures(failures)
+            elif path and self.can_shutdown and self.shutdown_when_finished.get() and not pause.is_set():
+                self.start_shutdown_countdown(60)
 
         self.status.set("Building montage…")
         self.work(operation, complete)
+
+    def start_shutdown_countdown(self, seconds):
+        if not self.shutdown_when_finished.get():
+            self.cancel_shutdown()
+            return
+        if seconds > 0:
+            self.cancel_shutdown_button.pack(side="right", padx=(0, 6))
+            self.status.set(f"Montage saved. Windows will shut down in {seconds}s.")
+            self.shutdown_task = self.root.after(1000, self.start_shutdown_countdown, seconds - 1)
+            return
+        self.shutdown_task = None
+        self.shutdown_when_finished.set(False)
+        self.cancel_shutdown_button.pack_forget()
+        self.save_settings()
+        try:
+            run(["shutdown.exe", "/s", "/t", "0"])
+        except (OSError, RuntimeError) as error:
+            self.status.set(f"Montage saved. Windows could not shut down. {error}")
+
+    def cancel_shutdown(self, quiet=False):
+        if self.shutdown_task is not None:
+            self.root.after_cancel(self.shutdown_task)
+            self.shutdown_task = None
+            self.shutdown_when_finished.set(False)
+            self.cancel_shutdown_button.pack_forget()
+            if not quiet:
+                self.status.set("Montage saved. Shutdown cancelled.")
 
     def show_failures(self, failures):
         details = "\n\n".join(f"{source.name}\n" + "\n".join(errors) for source, errors in failures)

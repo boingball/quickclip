@@ -46,6 +46,10 @@ If the score is readable and the skull is visible but the test finds no match, d
 
 Click **Pause montage** to stop after the current clip or conversion finishes. QuickClip saves completed work in the output folder. You can change the Radeon options, then click **Resume montage**, including after reopening QuickClip. Resume uses the selected clips and audio offset from the saved build. It uses the current Radeon options for work that remains.
 
+QuickClip saves the replay list, completed scans and your **Keep** choices as you go. On reopening the same input, it restores the review. Click **Resume replay scan** to scan the remaining recordings using the saved detection settings. A recording with a changed file size or modification time is scanned again.
+
+On Windows, tick **Shut down PC after montage** for an unattended build. QuickClip starts a 60-second **Cancel shutdown** countdown only after successfully saving the montage with no clip errors. The option starts unchecked each time you open QuickClip.
+
 Open **OCR readout** to see possible names and readable rows from each recording. If those rows look wrong, open **Set kill-feed area**, load a frame at a known kill, and draw a tight box around the complete feed. Choose **Colored HUD** for red, blue, or green lettering, **Bright text** for light lettering, or **Grayscale** for an unfiltered comparison. Click **Test feed OCR** to see the processed crop and Tesseract's readings for that frame before saving or scanning the folder. The numbers next to the words are Tesseract confidence scores. **Match name anywhere in feed** is a looser check that can also include deaths and assists.
 
 In **Set kill-feed area**, include the entire feed with space for long names on both sides. **Test feed OCR** shows the detected gaps and labels each word left, right, or unknown. **OCR readout** counts all three. A lone readable name has an unknown side in automatic mode. Use **Match name anywhere in feed** to include those moments for manual review. For a feed with a fixed split, enable **Use fixed divider** to use a single vertical line.
