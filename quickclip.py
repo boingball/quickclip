@@ -77,6 +77,43 @@ def run(command, **kwargs):
     return result.stdout
 
 
+def run_export(command, description, progress, duration=None):
+    """Report ffmpeg video output as it is written and retain stderr for failures."""
+    command = command[:1] + ["-nostats", "-stats_period", "1", "-progress", "pipe:1"] + command[1:]
+    with tempfile.TemporaryFile() as errors:
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, encoding="utf-8",
+                              errors="replace", **BACKGROUND) as process:
+            stats = {}
+            try:
+                for line in process.stdout:
+                    key, separator, value = line.strip().partition("=")
+                    if not separator:
+                        continue
+                    stats[key] = value.strip()
+                    if key != "progress":
+                        continue
+                    frame = stats.get("frame", "")
+                    if frame.isdecimal() and int(frame) > 0:
+                        details = [description, f"{frame} frames"]
+                        timestamp = stats.get("out_time_us", "")
+                        if timestamp.lstrip("-").isdecimal():
+                            seconds = max(0, int(timestamp) / 1_000_000)
+                            span = f" / {duration:.1f}s" if duration is not None else ""
+                            details.append(f"{seconds:.1f}s{span} written")
+                        speed = stats.get("speed", "")
+                        if speed.endswith("x"):
+                            details.append(speed)
+                        progress(" · ".join(details))
+                    stats.clear()
+                if process.wait():
+                    errors.seek(0)
+                    raise RuntimeError(errors.read().decode(errors="replace").strip()
+                                       or "FFmpeg export failed.")
+            finally:
+                if process.poll() is None:
+                    process.kill()
+
+
 @lru_cache(maxsize=8)
 def ffmpeg_features(executable, listing):
     return run([executable, "-hide_banner", listing]).decode(errors="replace").split()
@@ -829,17 +866,18 @@ def export_clip(source, clip, directory, progress=print, *, audio_offset_ms=0,
             audio_filter += f",asetpts=PTS+({audio_offset_ms}/1000)/TB"
         command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                    "-filter_threads", "1", "-ss", f"{seek:.3f}"]
+        duration = clip.end - clip.start
         streams = ["-i", str(source), "-ss", f"{clip.start - seek:.3f}",
-                   "-t", f"{clip.end - clip.start:.3f}",
+                   "-t", f"{duration:.3f}",
                    "-map", "0:V:0", "-map", "0:a?", "-map_chapters", "-1",
                    # Preserve the recording's frame cadence and audio timestamp gaps.
                    "-fps_mode", "passthrough", "-af", audio_filter,
                    "-c:a", "flac"]
-        encode_video(command, streams, encoded, progress, acceleration)
+        encode_video(command, streams, encoded, progress, acceleration, duration)
         return publish_export(encoded, directory, stem)
 
 
-def encode_video(command, streams, encoded, progress, acceleration):
+def encode_video(command, streams, encoded, progress, acceleration, duration):
     radeon = command[:1] + RADEON_DECODE_ARGS + command[1:]
     if acceleration.encode:
         amf = ["-c:v", "h264_amf", "-pix_fmt", "nv12", "-usage", "transcoding", "-quality", "quality",
@@ -849,7 +887,8 @@ def encode_video(command, streams, encoded, progress, acceleration):
         for options, description in plans:
             progress(f"Trying {description}…")
             try:
-                run(options + ["-threads:v", "2"] + streams + amf + [str(encoded)])
+                run_export(options + ["-threads:v", "2"] + streams + amf + [str(encoded)],
+                           description, progress, duration)
                 return
             except RuntimeError as error:
                 encoded.unlink(missing_ok=True)
@@ -859,28 +898,31 @@ def encode_video(command, streams, encoded, progress, acceleration):
     if acceleration.decode:
         progress("Trying Radeon decoding with CPU encoding…")
         try:
-            encode_x264(radeon, streams, encoded, progress)
+            encode_x264(radeon, streams, encoded, progress, duration)
             return
         except RuntimeError:
             encoded.unlink(missing_ok=True)
             progress("Radeon decoding failed for this export. Retrying with CPU decoding.")
-    encode_x264(command, streams, encoded, progress)
+    encode_x264(command, streams, encoded, progress, duration)
 
 
-def encode_x264(command, streams, encoded, progress):
+def encode_x264(command, streams, encoded, progress, duration):
     streams = streams + ["-c:v", "libx264", "-crf", "18"]
+    description = "Radeon decoding and CPU encoding (x264)" if "-hwaccel" in command else "CPU encoding (x264)"
     try:
-        run(command + ["-threads:v", "2"] + streams
-            + ["-threads:v", "2", "-preset", "fast", "-x264-params",
-               "rc-lookahead=12:lookahead-threads=1", str(encoded)])
+        run_export(command + ["-threads:v", "2"] + streams
+                   + ["-threads:v", "2", "-preset", "fast", "-x264-params",
+                      "rc-lookahead=12:lookahead-threads=1", str(encoded)],
+                   description, progress, duration)
     except RuntimeError as error:
         if not re.search(r"malloc of size .* failed|cannot allocate memory|out of memory",
                          str(error), re.IGNORECASE):
             raise
         encoded.unlink(missing_ok=True)
         progress("Encoder ran out of memory. Retrying with a lower-memory preset.")
-        run(command + ["-threads:v", "1"] + streams
-            + ["-threads:v", "1", "-preset", "ultrafast", str(encoded)])
+        run_export(command + ["-threads:v", "1"] + streams
+                   + ["-threads:v", "1", "-preset", "ultrafast", str(encoded)],
+                   description, progress, duration)
 
 
 def publish_export(encoded, directory, stem):
@@ -960,8 +1002,12 @@ def process_batch(sources, options, output=None, progress=print, *, audio_offset
 def export_candidates(result, output, progress, audio_offset_ms, acceleration):
     for count, clip in enumerate(result.clips, 1):
         progress(f"Exporting clip {count}/{len(result.clips)} ({clip.start:.2f}–{clip.end:.2f}s)")
+
+        def report(message):
+            progress(f"Clip {count}/{len(result.clips)} · {message}")
+
         try:
-            result.exports.append(export_clip(result.source, clip, output, progress=progress,
+            result.exports.append(export_clip(result.source, clip, output, progress=report,
                                               audio_offset_ms=audio_offset_ms, acceleration=acceleration))
         except (OSError, RuntimeError) as error:
             result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
@@ -1068,7 +1114,7 @@ def normalize_montage_segment(path, width, height, audio, order, progress, accel
                f"h='max(2,trunc(min({height},{width}/dar)/2)*2)',"
                f"setsar=1,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p")
     streams += ["-vf", filters, "-fps_mode", "passthrough", "-c:a", "flac", "-sample_fmt:a", "s32"]
-    encode_video(command, streams, converted, progress, acceleration)
+    encode_video(command, streams, converted, progress, acceleration, duration)
     converted.replace(path)
 
 
@@ -1146,7 +1192,11 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
             try:
                 if mixed:
                     progress(f"Converting clip {index}/{len(segments)} · {segment.result.source.name}")
-                    normalize_montage_segment(segment.path, width, height, audio, order, progress, acceleration)
+
+                    def report(message):
+                        progress(f"Converting clip {index}/{len(segments)} · {message}")
+
+                    normalize_montage_segment(segment.path, width, height, audio, order, report, acceleration)
                 else:
                     pad_montage_audio(segment.path, segment.layout, expected)
             except (OSError, RuntimeError, ValueError) as error:
@@ -1166,7 +1216,7 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
             tags = stream.get("tags", {})
             for key in ("title", "language"):
                 command += [f"-metadata:s:a:{index}", f"{key}={tags.get(key, '')}"]
-        run(command + [str(encoded)])
+        run_export(command + [str(encoded)], "Joining montage", progress)
         return results, publish_export(encoded, output, "kill-montage")
 
 

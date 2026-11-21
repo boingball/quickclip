@@ -109,4 +109,6 @@ Enable **Radeon hardware encoding** to try FFmpeg's AMD AMF H.264 encoder (`h264
 
 Use an FFmpeg build that lists `h264_amf` in `ffmpeg -encoders` and `d3d11va` in `ffmpeg -hwaccels`, with your Radeon driver installed. QuickClip falls back to CPU processing if a feature is missing or the hardware attempt fails.
 
+During exports, QuickClip displays the active encoder, frames written, output time, and speed as FFmpeg reports them. Mixed-format montages first export the clips, then convert them to a common format before joining them. The join step copies streams into the final MKV.
+
 The command-line equivalents are `--radeon-encode` and `--radeon-decode`.
