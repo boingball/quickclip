@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager, nullcontext
 import csv
 from dataclasses import dataclass, field
+from datetime import date, datetime
 from functools import lru_cache
 import hashlib
 from itertools import islice
@@ -47,6 +48,7 @@ class BatchResult:
     clips: list[Clip]
     exports: list[Path]
     errors: list[str]
+    audio_tracks: int | None = None
     feed_scanned: bool = False
     feed_rows: Counter = field(default_factory=Counter)
     feed_mentions: int = 0
@@ -272,7 +274,7 @@ OCR_MODES = ("Grayscale", "Bright text", "Colored HUD", GREEN_PLAYER, FAINT_TEXT
 KILL_BADGE_MODE = OCR_MODES[0]
 KILL_BADGE_PAGE_MODE = "11"
 KILL_BADGE_TEXT_LUT = bytes(0 if value >= 175 else 255 for value in range(256))
-SKULL_SAMPLE_SIZE = 12
+OCR_PATCH_SIZE = 12
 OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored", "green", "faint"), OCR_MODES))
 OCR_WIDTH, OCR_HEIGHT = 960, 480
 OCR_HEADER = f"P5\n{OCR_WIDTH} {OCR_HEIGHT}\n255\n".encode("ascii")
@@ -346,9 +348,26 @@ class SkullReference:
                                           for value in self.box)
                 or not (-3.1 <= self.box[0] <= 0 and -.6 <= self.box[1] <= 1.6)
                 or not all(.3 <= size <= 2.5 for size in self.box[2:])
-                or len(self.pixels) != SKULL_SAMPLE_SIZE ** 2
+                or len(self.pixels) != OCR_PATCH_SIZE ** 2
                 or not all(type(value) is int and 0 <= value <= 255 for value in self.pixels)):
             raise ValueError("Invalid skull reference.")
+
+
+@dataclass(frozen=True)
+class WeaponReference:
+    label: str
+    mode: str
+    box: tuple[float, float, float, float]
+    pixels: tuple[int, ...]
+
+    def __post_init__(self):
+        if (not isinstance(self.label, str) or not self.label.strip() or len(self.label) > 32
+                or self.mode not in OCR_MODES or len(self.box) != 4
+                or not all(isinstance(value, (int, float)) and math.isfinite(value) for value in self.box)
+                or not all(.2 <= size <= 12 for size in self.box[2:])
+                or len(self.pixels) != OCR_PATCH_SIZE ** 2
+                or not all(type(value) is int and 0 <= value <= 255 for value in self.pixels)):
+            raise ValueError("Invalid weapon reference.")
 
 
 @dataclass(frozen=True)
@@ -361,6 +380,7 @@ class KillFeedOptions:
     divider: float | None = None
     badge: bool = False
     skull_reference: SkullReference | None = None
+    weapon_references: tuple[WeaponReference, ...] = ()
 
 
 def parse_feed_region(text):
@@ -585,17 +605,17 @@ def skull_search_preview(frame, score):
     return header + b"".join(rows)
 
 
-def sample_skull(frame, left, top, width, height):
+def sample_ocr_patch(frame, left, top, width, height):
     if left < 0 or top < 0 or left + width > OCR_WIDTH or top + height > OCR_HEIGHT:
         return ()
-    columns = [left + width * (2 * x + 1) // (2 * SKULL_SAMPLE_SIZE)
-               for x in range(SKULL_SAMPLE_SIZE)]
-    offsets = [len(OCR_HEADER) + OCR_WIDTH * (top + height * (2 * y + 1) // (2 * SKULL_SAMPLE_SIZE))
-               for y in range(SKULL_SAMPLE_SIZE)]
+    columns = [left + width * (2 * x + 1) // (2 * OCR_PATCH_SIZE)
+               for x in range(OCR_PATCH_SIZE)]
+    offsets = [len(OCR_HEADER) + OCR_WIDTH * (top + height * (2 * y + 1) // (2 * OCR_PATCH_SIZE))
+               for y in range(OCR_PATCH_SIZE)]
     return tuple(frame[offset + x] for offset in offsets for x in columns)
 
 
-def normalize_skull(pixels):
+def normalize_ocr_patch(pixels):
     if not pixels:
         return ()
     mean = sum(pixels) / len(pixels)
@@ -606,6 +626,67 @@ def normalize_skull(pixels):
     return tuple(pixel / length for pixel in centered)
 
 
+def weapon_anchor(row):
+    if row.divider is None:
+        return None
+    names = [word for word in row.words if NAME_TOKEN.fullmatch(word.text)]
+    left = [word for word in names if word.centre < row.divider]
+    right = [word for word in names if word.centre >= row.divider]
+    if not left or not right:
+        return None
+    a, b = left[-1], right[0]
+    return a.right, b.left, (a.middle + b.middle) / 2, max(a.height, b.height)
+
+
+def make_weapon_reference(frame, rows, bounds, label, mode):
+    left, top, right, bottom = bounds
+    width, height = right - left, bottom - top
+    for row in rows:
+        anchor = weapon_anchor(row)
+        if anchor is None:
+            continue
+        start, end, middle, row_height = anchor
+        if not (start - 2 <= left < right <= end + 2
+                and abs((top + bottom) / 2 - middle) <= .75 * row_height):
+            continue
+        pixels = sample_ocr_patch(frame, left, top, width, height)
+        if normalize_ocr_patch(pixels):
+            box = ((left - (start + end) / 2) / row_height, (top - middle) / row_height,
+                   width / row_height, height / row_height)
+            return WeaponReference(label.strip(), mode, box, pixels)
+    raise ValueError("Select a clear weapon icon between two readable names on one kill-feed row.")
+
+
+def recognize_weapon(frame, row, references, mode):
+    anchor = weapon_anchor(row)
+    if anchor is None:
+        return None
+    start, end, middle, height = anchor
+    scores = []
+    for reference in references:
+        if reference.mode != mode:
+            continue
+        template = normalize_ocr_patch(reference.pixels)
+        x, y, width, box_height = (round(value * height) for value in reference.box)
+        if not template or width < 2 or box_height < 2:
+            continue
+        x += round((start + end) / 2)
+        y += round(middle)
+        step = max(1, height // 6)
+        best = 0
+        for dx in (0, -step, step, -2 * step, 2 * step):
+            if x + dx < start - 2 or x + dx + width > end + 2:
+                continue
+            for dy in (0, -step, step):
+                patch = normalize_ocr_patch(sample_ocr_patch(frame, x + dx, y + dy, width, box_height))
+                best = max(best, sum(a * b for a, b in zip(template, patch)))
+        scores.append((best, reference.label))
+    scores.sort(reverse=True)
+    if scores and scores[0][0] >= .90 and (len(scores) == 1 or scores[0][0] - scores[1][0] >= .04):
+        return scores[0][1]
+    return None
+
+
 def make_skull_reference(frame, score, bounds):
     left, top, right, bottom = bounds
     search_left, search_top, search_right, search_bottom = skull_search_area(score)
@@ -613,15 +694,15 @@ def make_skull_reference(frame, score, bounds):
     if not (search_left <= left < right <= search_right and search_top <= top < bottom <= search_bottom
             and width >= .3 * score.height and height >= .3 * score.height):
         raise ValueError("Draw a tight box around the whole skull inside the zoomed area.")
-    pixels = sample_skull(frame, left, top, width, height)
-    if not normalize_skull(pixels):
+    pixels = sample_ocr_patch(frame, left, top, width, height)
+    if not normalize_ocr_patch(pixels):
         raise ValueError("That selection has too little contrast. Include the outline and eye sockets.")
     box = tuple(value / score.height for value in (left - score.left, top - score.top, width, height))
     return SkullReference(box, pixels)
 
 
 def matches_skull_reference(frame, score, reference):
-    template = normalize_skull(reference.pixels)
+    template = normalize_ocr_patch(reference.pixels)
     if not template:
         return False
     x, y, width, height = (round(value * score.height) for value in reference.box)
@@ -633,7 +714,7 @@ def matches_skull_reference(frame, score, reference):
         top = score.top + y + (height - h) // 2
         for dx in shifts:
             for dy in shifts:
-                pixels = normalize_skull(sample_skull(frame, left + dx, top + dy, w, h))
+                pixels = normalize_ocr_patch(sample_ocr_patch(frame, left + dx, top + dy, w, h))
                 if sum(expected * actual for expected, actual in zip(template, pixels)) >= .87:
                     return True
     return False
@@ -676,7 +757,7 @@ def kill_badge_match(frame, rows, reference=None):
 
 def ocr_events(path, region, reason, identify, duration, progress, *,
                page_mode="11", stop=None, mode=OCR_MODES[0], for_ocr=None, rounding="near",
-               hardware_decode=False):
+               hardware_decode=False, describe=None):
     filters = f"fps=2:start_time=0:round={rounding}," + ocr_filter(region, mode)
     command = decode(path, "-filter_threads", "1", "-threads:v", "1")
     command += ["-map", "0:V:0", "-an", "-vf", filters, "-threads:v", "1",
@@ -702,6 +783,9 @@ def ocr_events(path, region, reason, identify, duration, progress, *,
             previous = set().union(*recent)
             if matches - previous:
                 yield timestamp, reason
+                if describe:
+                    for detail in describe(rows, frame, matches - previous):
+                        yield timestamp, detail
             recent.append(matches)
 
 
@@ -811,10 +895,21 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                         diagnostics.feed_rows[line] += 1
             return matches
 
+        def describe_weapons(rows, frame, new_matches):
+            for row in position_feed_rows(rows, divider):
+                if row.text.casefold() not in new_matches:
+                    continue
+                if any(side == "left" and (marked_green or not green_only)
+                       for _, side, marked_green in row.name_sides(feed_pattern)):
+                    weapon = recognize_weapon(frame, row, feed.weapon_references, feed.mode)
+                    if weapon:
+                        yield f"Weapon: {weapon}"
+
         events.extend(ocr_events(path, feed.region if feed else FEED, "Kill feed", feed_matches,
                                  recording.duration, progress, page_mode="6" if feed else "11",
                                  stop=stop, mode=feed.mode if feed else OCR_MODES[0],
-                                 hardware_decode=acceleration.decode))
+                                 hardware_decode=acceleration.decode,
+                                 describe=describe_weapons if feed and feed.weapon_references else None))
     if badge:
         if diagnostics is not None:
             diagnostics.badge_samples = 0
@@ -828,11 +923,18 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                 diagnostics.badge_reference_matches += bool(evidence and evidence.startswith("saved skull"))
             return {"KILL"} if evidence else set()
 
+        def describe_target(rows, _frame, _matches):
+            rows = position_feed_rows(rows, None)
+            if any(re.search(r"\bHELICOPTER\s+(?:DESTROYED|KILL)\b", row.text, re.IGNORECASE) for row in rows):
+                yield "Target: Helicopter"
+            elif any(re.search(r"\bVEHICLE\s+DESTROYED\b", row.text, re.IGNORECASE) for row in rows):
+                yield "Target: Vehicle"
+
         # Use the last source frame at or before each half-second sample.
         events.extend(ocr_events(path, KILL_BADGE_REGION, "KILL badge", badge_matches,
                                  recording.duration, progress, page_mode=KILL_BADGE_PAGE_MODE,
                                  stop=stop, mode=KILL_BADGE_MODE, for_ocr=badge_text_frame, rounding="up",
-                                 hardware_decode=acceleration.decode))
+                                 hardware_decode=acceleration.decode, describe=describe_target))
     if score_pattern:
         def score_matches(rows, _frame):
             text = "\n".join(row.text for row in rows)
@@ -961,6 +1063,44 @@ def folder_recordings(folder):
     return sources
 
 
+def recording_date(path):
+    for match in re.finditer(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)", path.stem):
+        try:
+            return date.fromisoformat(match.group())
+        except ValueError:
+            continue
+    return datetime.fromtimestamp(path.stat().st_mtime).date()
+
+
+def filter_recording_dates(dates, first, last):
+    try:
+        start = date.fromisoformat(first) if first else None
+        end = date.fromisoformat(last) if last else None
+    except ValueError as error:
+        raise ValueError("Enter recording dates as YYYY-MM-DD.") from error
+    if start and end and start > end:
+        raise ValueError("The first recording date must be on or before the last date.")
+    matches = [path for path, day in dates.items()
+               if (start is None or day >= start) and (end is None or day <= end)]
+    if not matches:
+        raise ValueError("No recordings in that date range.")
+    return matches
+
+
+def clip_preview_frames(source, clip):
+    frames = []
+    length = clip.end - clip.start
+    for position in (.08, .5, .92):
+        seconds = clip.start + length * position
+        image = run(["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{seconds:.3f}",
+                     "-filter_threads", "1", "-threads:v", "1", "-i", str(source),
+                     "-map", "0:V:0", "-frames:v", "1",
+                     "-vf", "scale=160:90:force_original_aspect_ratio=decrease,pad=160:90:(ow-iw)/2:(oh-ih)/2",
+                     "-c:v", "ppm", "-f", "image2pipe", "pipe:1"])
+        frames.append((seconds, image))
+    return frames
+
+
 def prepare_output(sources, output):
     destination = output.resolve()
     if any(source.parent.resolve() == destination for source in sources):
@@ -982,6 +1122,7 @@ def scan_recording(source, options, progress, *, feed=None, stop=None, accelerat
     progress("Reading recording")
     try:
         recording = probe(source)
+        result.audio_tracks = len(recording.audio)
         result.clips = scan(source, recording, *options, progress=progress, feed=feed,
                             diagnostics=result if feed else None, stop=stop, acceleration=acceleration)
         if feed and feed.fallback_track and not result.clips:
@@ -1393,6 +1534,8 @@ def main():
     parser.add_argument("--output", type=Path, help="Export every candidate here. Omit to list candidates.")
     parser.add_argument("--files", type=int, metavar="N",
                         help="Process only the first N recordings in a folder, sorted by filename.")
+    parser.add_argument("--from-date", default="", metavar="YYYY-MM-DD", help="First recording date to include.")
+    parser.add_argument("--to-date", default="", metavar="YYYY-MM-DD", help="Last recording date to include.")
     parser.add_argument("--kill-montage", action="store_true",
                         help="Join kill matches into one MKV. Requires --output and either --player or --kill-badge.")
     parser.add_argument("--kill-badge", action="store_true",
@@ -1428,6 +1571,9 @@ def main():
     try:
         acceleration = resolve_video_acceleration(VideoAcceleration(args.radeon_encode, args.radeon_decode))
         sources = folder_recordings(args.recording) if is_folder else [args.recording]
+        if args.from_date or args.to_date:
+            sources = filter_recording_dates({path: recording_date(path) for path in sources},
+                                             args.from_date, args.to_date)
         if args.files is not None:
             sources = sources[:args.files]
         before = args.before if args.before is not None else (3 if args.kill_montage else 10)

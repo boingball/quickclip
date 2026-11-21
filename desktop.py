@@ -15,12 +15,15 @@ from threading import Event, Thread
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from date_picker import pick_dates
 from quickclip import (
     BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, FEED, GREEN_PLAYER, KillFeedOptions, NAME_TOKEN, OCR_MODES,
     RECORDING_EXTENSIONS, export_clip, folder_recordings, parse_feed_divider, parse_feed_region, prepare_output,
     MontagePaused, SkullReference, VideoAcceleration, badge_scores, kill_badge_match, latest_montage_job,
     make_skull_reference, preview_feed, preview_kill_badge, probe, process_batch, resolve_video_acceleration,
     resume_montage_job, run, save_montage_job, scan_kills, skull_search_area, skull_search_preview,
+    WeaponReference, clip_preview_frames, filter_recording_dates, make_weapon_reference, recognize_weapon,
+    recording_date,
 )
 from scan_review import SavedScan
 
@@ -73,6 +76,10 @@ class Desktop:
     def __init__(self, root):
         self.root = root
         self.sources = []
+        self.recording_dates = {}
+        self.thumbnail_task = None
+        self.thumbnail_version = 0
+        self.audio_lookup = set()
         self.input_path = None
         self.default_output = None
         self.output = None
@@ -96,6 +103,9 @@ class Desktop:
         self.status = tk.StringVar(value="Open an OBS recording or folder to get started.")
         self.filename = tk.StringVar(value="No input selected")
         self.output_name = tk.StringVar(value="No output folder selected")
+        self.from_date = tk.StringVar()
+        self.to_date = tk.StringVar()
+        self.date_range_label = tk.StringVar(value="No recording dates available")
         self.keep_count = tk.StringVar()
         self.score_enabled = tk.BooleanVar()
         self.player = tk.StringVar()
@@ -111,6 +121,7 @@ class Desktop:
         self.radeon_decode = tk.BooleanVar()
         self.shutdown_when_finished = tk.BooleanVar()
         self.skull_reference = None
+        self.weapon_references = ()
 
         root.title("QuickClip")
         root.minsize(720, 460)
@@ -128,6 +139,11 @@ class Desktop:
         self.output_button = ttk.Button(output_row, text="Output folder…", command=self.choose_output)
         self.output_button.pack(side="left")
         ttk.Label(output_row, textvariable=self.output_name).pack(side="left", padx=10)
+        date_row = ttk.Frame(body)
+        date_row.pack(fill="x", pady=(8, 0))
+        self.date_button = ttk.Button(date_row, text="Pick dates…", command=self.choose_dates)
+        self.date_button.pack(side="left")
+        ttk.Label(date_row, textvariable=self.date_range_label, wraplength=720).pack(side="left", padx=10)
 
         settings = ttk.LabelFrame(body, text="Highlight detection", padding=10)
         settings.pack(fill="x", pady=12)
@@ -191,24 +207,30 @@ class Desktop:
 
         results = ttk.Frame(body)
         results.pack(fill="both", expand=True)
-        self.table = ttk.Treeview(results, columns=("keep", "source", "start", "end", "reasons"),
-                                  displaycolumns=("source", "start", "end", "reasons"), show="headings")
+        self.result_columns = ("source", "start", "end", "audio", "reasons", "details")
+        self.table = ttk.Treeview(results, columns=("keep", *self.result_columns),
+                                  displaycolumns=self.result_columns, show="headings")
         self.table.heading("keep", text="Keep")
         self.table.column("keep", width=58, anchor="center", stretch=False)
-        for name, title, width in (("source", "Recording", 250), ("start", "Start", 100),
-                                   ("end", "End", 100), ("reasons", "Detected by", 210)):
+        for name, title, width in (("source", "Recording", 230), ("start", "Start", 85),
+                                   ("end", "End", 85), ("audio", "Audio", 74),
+                                   ("reasons", "Detected by", 128), ("details", "Weapon / target", 130)):
             self.table.heading(name, text=title)
-            self.table.column(name, width=width, stretch=name in ("source", "reasons"))
+            self.table.column(name, width=width, stretch=name in ("source", "reasons", "details"))
         scrollbar = ttk.Scrollbar(results, orient="vertical", command=self.table.yview)
         self.table.configure(yscrollcommand=scrollbar.set)
         scrollbar.pack(side="right", fill="y")
         self.table.pack(side="left", fill="both", expand=True)
-        self.table.bind("<<TreeviewSelect>>", lambda _: self.buttons())
+        self.table.bind("<<TreeviewSelect>>", self.select_clip)
         self.table.bind("<Button-1>", self.click_keep)
         self.table.bind("<Double-1>", self.double_click)
         self.table.bind("<space>", self.toggle_focused)
 
-        actions = ttk.Frame(body)
+        self.preview_strip = ttk.LabelFrame(body, text="Selected clip frames", padding=6)
+        self.thumbnail_labels = [ttk.Label(self.preview_strip, compound="top", anchor="center") for _ in range(3)]
+        for label in self.thumbnail_labels:
+            label.pack(side="left", padx=6)
+        self.actions = actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(10, 0))
         self.preview_button = ttk.Button(actions, text="Play clip", command=self.preview)
         self.preview_button.pack(side="left")
@@ -256,7 +278,8 @@ class Desktop:
                 field.delete(0, "end")
                 field.insert(0, values[key])
         for key, field in (("player", self.player), ("score", self.score), ("feed_region", self.feed_region),
-                           ("feed_divider", self.feed_divider)):
+                           ("feed_divider", self.feed_divider), ("from_date", self.from_date),
+                           ("to_date", self.to_date)):
             if isinstance(values.get(key), str):
                 field.set(values[key])
         self.score_enabled.set(values.get("score_enabled") is True)
@@ -275,6 +298,13 @@ class Desktop:
                 self.skull_reference = SkullReference(tuple(stored_reference["box"]), tuple(stored_reference["pixels"]))
             except (KeyError, TypeError, ValueError):
                 pass
+        try:
+            self.weapon_references = tuple(
+                WeaponReference(item["label"], item["mode"], tuple(item["box"]), tuple(item["pixels"]))
+                for item in values.get("weapon_references", ())
+            )
+        except (KeyError, TypeError, ValueError):
+            pass
         if isinstance(values.get("output"), str) and values["output"]:
             self.output = Path(values["output"])
             self.show_output()
@@ -290,9 +320,11 @@ class Desktop:
                       any_feed_mention=self.any_feed_mention.get(), audio_fallback=self.audio_fallback.get(),
                       feed_mode=self.feed_mode.get(), feed_divider=self.feed_divider.get(),
                       fixed_feed_divider=self.fixed_feed_divider.get(), montage_cue=self.montage_cue.get(),
+                      from_date=self.from_date.get(), to_date=self.to_date.get(),
                       radeon_encode=self.radeon_encode.get(), radeon_decode=self.radeon_decode.get())
         if self.skull_reference is not None:
             values["skull_reference"] = asdict(self.skull_reference)
+        values["weapon_references"] = [asdict(reference) for reference in self.weapon_references]
         temp = None
         try:
             self.settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -323,6 +355,8 @@ class Desktop:
             return
         self.cancel_shutdown(quiet=True)
         self.stop_feed_playback()
+        if self.thumbnail_task is not None:
+            self.root.after_cancel(self.thumbnail_task)
         if self.scan_stop is not None:
             self.scan_stop.set()
         self.root.after_cancel(self.poll_task)
@@ -339,6 +373,7 @@ class Desktop:
         can_preview = bool(self.table.selection()) and (not self.busy or self.montage_scanning)
         for button in (self.open_button, self.folder_button, self.output_button):
             button.configure(state="disabled" if self.busy else "normal")
+        self.date_button.configure(state="normal" if self.recording_dates and not self.busy else "disabled")
         for button in (self.scan_button, self.batch_button, self.montage_button, self.crop_button):
             button.configure(state="normal" if self.sources and not self.busy else "disabled")
         self.feed_button.configure(state="normal" if self.feed_results else "disabled")
@@ -393,6 +428,12 @@ class Desktop:
                     self.update_keep_count()
                     self.buttons()
                     continue
+                if kind == "thumbnails":
+                    self.show_thumbnails(*value)
+                    continue
+                if kind == "audio_metadata":
+                    self.show_audio_metadata(*value)
+                    continue
                 self.busy = False
                 self.montage_pause = None
                 if self.montage_scanning:
@@ -424,11 +465,11 @@ class Desktop:
         self.keep_count.set("")
         self.table.delete(*self.table.get_children())
         if montage:
-            self.table.configure(displaycolumns=("keep", "source", "start", "end", "reasons"))
+            self.table.configure(displaycolumns=("keep", *self.result_columns))
             self.export_button.pack_forget()
             self.build_button.pack(side="right")
         else:
-            self.table.configure(displaycolumns=("source", "start", "end", "reasons"))
+            self.table.configure(displaycolumns=self.result_columns)
             self.build_button.pack_forget()
             self.export_button.pack(side="right")
 
@@ -505,29 +546,32 @@ class Desktop:
     def load_folder(self, folder, track=None):
         def inspect():
             sources = folder_recordings(folder)
+            dates = {source: recording_date(source) for source in sources}
             for source in sources:
                 try:
                     recording = probe(source)
                 except (RuntimeError, ValueError):
                     continue
-                return sources, recording, source
+                return sources, recording, source, dates
             raise ValueError("None of the recordings in this folder could be opened.")
 
         def complete(result):
-            sources, recording, sample = result
+            sources, recording, sample, dates = result
             self.set_input(sources, f"{folder.name} · {len(sources)} recordings",
-                           recording, sample, folder, track=track)
+                           recording, sample, folder, track=track, dates=dates)
 
         self.status.set("Finding recordings…")
         self.work(inspect, complete)
 
-    def set_input(self, sources, label, recording, sample, folder=None, *, track=None):
+    def set_input(self, sources, label, recording, sample, folder=None, *, track=None, dates=None):
         self.clear()
         self.sources = sources
+        self.recording_dates = dates if dates is not None else {sample: recording_date(sample)}
         self.input_path = folder or sample
         self.filename.set(label)
         self.default_output = folder / "Highlights" if folder else None
         self.show_output()
+        self.show_date_range()
         tracks = ["Auto", "Off"] + [f"{index}: {title}" for index, title in enumerate(recording.audio, 1)]
         self.track.configure(values=tracks)
         self.track.current(tracks.index(track) if track in tracks else 0)
@@ -540,6 +584,66 @@ class Desktop:
                             "Auto looks for the isolated mic track. You can also pick it manually.")
         if self.saved_scan and self.saved_scan.input_path == self.input_path:
             self.restore_replay_list()
+
+    def show_date_range(self):
+        oldest, newest = min(self.recording_dates.values()), max(self.recording_dates.values())
+        first, last = self.from_date.get(), self.to_date.get()
+        current = f"{first or 'Any start'} to {last or 'Any end'}" if first or last else "All dates"
+        self.date_range_label.set(f"{current} · Oldest {oldest} · Newest {newest}")
+
+    def choose_dates(self):
+        dates = self.recording_dates
+
+        def apply(first, last):
+            filter_recording_dates(dates, first, last)
+            self.from_date.set(first)
+            self.to_date.set(last)
+            self.show_date_range()
+            self.save_settings()
+
+        pick_dates(self.root, self.from_date.get(), self.to_date.get(),
+                   min(dates.values()), max(dates.values()), apply)
+
+    def select_clip(self, _):
+        self.buttons()
+        self.thumbnail_version += 1
+        if self.thumbnail_task is not None:
+            self.root.after_cancel(self.thumbnail_task)
+            self.thumbnail_task = None
+        selected = self.table.selection()
+        if not selected:
+            self.preview_strip.pack_forget()
+            return
+        for label in self.thumbnail_labels:
+            label.configure(image="", text="")
+            label.image = None
+        self.thumbnail_labels[0].configure(text="Loading frames…")
+        self.preview_strip.pack(fill="x", before=self.actions, pady=(6, 0))
+        source, clip = self.clips[int(selected[0])]
+        self.thumbnail_task = self.root.after(150, self.load_thumbnails, self.thumbnail_version, source, clip)
+
+    def load_thumbnails(self, version, source, clip):
+        self.thumbnail_task = None
+
+        def worker():
+            try:
+                frames = clip_preview_frames(source, clip)
+            except (OSError, RuntimeError, ValueError):
+                frames = []
+            self.messages.put(("thumbnails", (version, frames)))
+
+        Thread(target=worker, daemon=True).start()
+
+    def show_thumbnails(self, version, frames):
+        if version != self.thumbnail_version:
+            return
+        if not any(data for _, data in frames):
+            self.thumbnail_labels[0].configure(text="Preview frames unavailable")
+            return
+        for label, (seconds, data) in zip(self.thumbnail_labels, frames):
+            if data:
+                label.image = tk.PhotoImage(master=self.root, data=data, format="PPM")
+                label.configure(image=label.image, text=clock(seconds))
 
     def show_output(self):
         directory = self.output or self.default_output
@@ -856,7 +960,8 @@ class Desktop:
                             f"{word.text} [{word.confidence:.0f}, {row.side(word)}"
                             f"{', green' if word.green else ''}]"
                             for word in row.words)
-                    detail.insert("end", words + "\n")
+                    weapon = recognize_weapon(image, row, self.weapon_references, treatment) if not badge else None
+                    detail.insert("end", words + (f" · Weapon: {weapon}" if weapon else "") + "\n")
                 if not badge and not any(row.readable for row in rows):
                     detail.insert("end", "\nNo confident name-like text on this frame.")
             else:
@@ -866,9 +971,62 @@ class Desktop:
         if scores:
             score = max(scores, key=lambda word: word.confidence)
             self.add_skull_reference_controls(frame, image, score, render_details)
+        if not badge:
+            self.add_weapon_reference_controls(frame, canvas, image, rows, treatment, render_details)
         detail.pack(fill="both", expand=True, pady=(8, 0))
         render_details()
         self.status.set("KILL badge OCR test complete." if badge else "Kill-feed OCR test complete.")
+
+    def add_weapon_reference_controls(self, frame, canvas, image, rows, mode, render_details):
+        controls = ttk.Frame(frame)
+        controls.pack(fill="x", pady=(6, 0))
+        ttk.Label(controls, text="Weapon label").pack(side="left")
+        name = ttk.Entry(controls, width=16)
+        name.pack(side="left", padx=6)
+        ttk.Label(frame, text="Draw a tight box around an icon between two readable names.").pack(anchor="w")
+        start = bounds = None
+
+        def drag(event):
+            nonlocal bounds
+            if start is None:
+                return
+            left, right = sorted((start[0], max(0, min(canvas.image.width(), event.x))))
+            top, bottom = sorted((start[1], max(0, min(canvas.image.height(), event.y))))
+            bounds = (2 * left, 2 * top, 2 * right, 2 * bottom)
+            canvas.delete("weapon-selection")
+            canvas.create_rectangle(left, top, right, bottom, outline="#ffe15c", width=2,
+                                    tags="weapon-selection")
+            save_button.configure(state="normal" if left < right and top < bottom else "disabled")
+
+        def begin(event):
+            nonlocal start
+            start = (event.x, event.y)
+            drag(event)
+
+        def save():
+            try:
+                reference = make_weapon_reference(image, rows, bounds, name.get(), mode)
+            except ValueError as error:
+                messagebox.showerror("QuickClip", str(error), parent=frame.winfo_toplevel())
+                return
+            self.weapon_references = tuple(
+                item for item in self.weapon_references
+                if (item.label.casefold(), item.mode) != (reference.label.casefold(), mode)
+            ) + (reference,)
+            self.save_settings()
+            render_details()
+
+        def clear():
+            self.weapon_references = tuple(item for item in self.weapon_references if item.mode != mode)
+            self.save_settings()
+            render_details()
+
+        canvas.bind("<Button-1>", begin)
+        canvas.bind("<B1-Motion>", drag)
+        canvas.bind("<ButtonRelease-1>", drag)
+        save_button = ttk.Button(controls, text="Save weapon icon", command=save, state="disabled")
+        save_button.pack(side="left")
+        ttk.Button(controls, text="Clear weapon labels", command=clear).pack(side="left", padx=6)
 
     def add_skull_reference_controls(self, frame, image, score, render_details):
         crop = skull_search_preview(image, score)
@@ -987,11 +1145,42 @@ class Desktop:
                 result = saved.results[source]
                 self.feed_results.append(result)
                 self.append_candidates(result)
+        self.load_saved_audio_metadata(saved)
         self.update_keep_count()
         pending = len(saved.pending())
         self.status.set(f"Restored {len(self.clips)} clip(s) from {len(saved.results)} replay(s). "
                         f"{pending} replay(s) still to scan.")
         self.buttons()
+
+    def load_saved_audio_metadata(self, saved):
+        missing = [result for result in saved.results.values()
+                   if result.audio_tracks is None and result.source not in self.audio_lookup]
+        self.audio_lookup.update(result.source for result in missing)
+
+        def worker():
+            for result in missing:
+                try:
+                    count = len(probe(result.source).audio)
+                except (OSError, RuntimeError, ValueError):
+                    count = None
+                self.messages.put(("audio_metadata", (saved, result, count)))
+
+        if missing:
+            Thread(target=worker, daemon=True).start()
+
+    def show_audio_metadata(self, saved, result, count):
+        self.audio_lookup.discard(result.source)
+        if saved is not self.saved_scan or count is None:
+            return
+        result.audio_tracks = count
+        try:
+            saved.write_result(result.source)
+        except OSError as error:
+            self.warn_review_save(error)
+        if self.reviewing_saved_scan:
+            for index, (source, _) in enumerate(self.clips):
+                if source == result.source:
+                    self.table.set(str(index), "audio", "No audio" if count == 0 else f"{count} track(s)")
 
     def resume_saved_scan(self):
         if self.saved_scan is None or self.saved_scan.input_path != self.input_path:
@@ -1011,6 +1200,8 @@ class Desktop:
                 player, before, after, feed = saved.player, saved.before, saved.after, saved.feed
             else:
                 before, after = float(self.before.get()), float(self.after.get())
+                if self.from_date.get() or self.to_date.get():
+                    sources = filter_recording_dates(self.recording_dates, self.from_date.get(), self.to_date.get())
             audio_offset = self.read_audio_offset() if auto_export else 0
             selection = self.track.current()
             track = "auto" if selection == 0 else selection - 1
@@ -1038,6 +1229,7 @@ class Desktop:
                         any_mention=self.any_feed_mention.get(), fallback_track=fallback,
                         threshold=threshold, mode=self.feed_mode.get(), badge=badge,
                         skull_reference=self.skull_reference,
+                        weapon_references=self.weapon_references,
                         divider=parse_feed_divider(self.feed_divider.get())
                         if player and self.fixed_feed_divider.get() else None,
                     )
@@ -1136,9 +1328,13 @@ class Desktop:
             keep = self.montage_review and position not in rejected
             if keep:
                 self.kept.add(index)
+            tracks = result.audio_tracks
+            audio = "Unknown" if tracks is None else ("No audio" if tracks == 0 else f"{tracks} track(s)")
+            details = [reason for reason in clip.reasons if reason.startswith(("Weapon: ", "Target: "))]
+            cues = [reason for reason in clip.reasons if reason not in details]
             self.table.insert("", "end", iid=str(index), values=(
                 ("☑" if keep else "☐") if self.montage_review else "", result.source.name, clock(clip.start),
-                clock(clip.end), ", ".join(clip.reasons)))
+                clock(clip.end), audio, ", ".join(cues), ", ".join(details) or "Unknown"))
         if self.montage_review and first == 0 and self.clips:
             self.table.selection_set("0")
             self.table.focus("0")

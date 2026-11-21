@@ -44,6 +44,12 @@ If the score is readable and the skull is visible but the test finds no match, d
 3. Select a row and click **Play clip** to preview it in FFplay. Click its **Keep** checkbox or press **Space** on the focused row to toggle it. All candidates are checked initially.
 4. Choose the output folder and click **Build montage** to join the checked clips into one MKV in filename order.
 
+Select a result to see three frames from the clip. Use them to compare similar clips before keeping them. The **Audio** column lists the source track count or **No audio**.
+
+**Pick dates** shows the oldest and newest recording dates and offers **Today**, **Yesterday**, **This week**, and custom calendar bounds. QuickClip uses a `YYYY-MM-DD` date in the filename when available, then falls back to the file's modified date. The date filter applies before the file limit. The CLI equivalents are `--from-date` and `--to-date`.
+
+For weapon hints, open **Test feed OCR** on a frame with both names readable. Draw a tight box around the weapon icon, enter a label such as **Rocket**, and click **Save weapon icon**. Use the same OCR treatment when scanning. QuickClip labels a weapon when it recognizes the saved icon on your killer-side row. **Both** lets the montage use this alongside badge detection. Lower HUD text such as **VEHICLE DESTROYED** can provide a target hint. A weapon icon alone cannot identify a helicopter.
+
 Click **Pause montage** to stop after the current clip or conversion finishes. QuickClip saves completed work in the output folder. You can change the Radeon options, then click **Resume montage**, including after reopening QuickClip. Resume uses the selected clips and audio offset from the saved build. It uses the current Radeon options for work that remains.
 
 QuickClip saves the replay list, completed scans and your **Keep** choices as you go. On reopening the same input, it restores the review. Click **Resume replay scan** to scan the remaining recordings using the saved detection settings. A recording with a changed file size or modification time is scanned again.

@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 from tempfile import NamedTemporaryFile, mkdtemp
 
-from quickclip import BatchResult, Clip, KillFeedOptions, SkullReference
+from quickclip import BatchResult, Clip, KillFeedOptions, SkullReference, WeaponReference
 
 
 def write_json(path, data):
@@ -44,6 +44,10 @@ class SavedScan:
         reference = options.get("skull_reference")
         if reference is not None:
             options["skull_reference"] = SkullReference(tuple(reference["box"]), tuple(reference["pixels"]))
+        options["weapon_references"] = tuple(
+            WeaponReference(item["label"], item["mode"], tuple(item["box"]), tuple(item["pixels"]))
+            for item in options.get("weapon_references", ())
+        )
         self.feed = KillFeedOptions(**options)
         self.results = {}
         self.rejections = {}
