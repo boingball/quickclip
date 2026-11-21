@@ -48,6 +48,9 @@ class BatchResult:
     feed_lookalikes: Counter = field(default_factory=Counter)
     feed_matches: int = 0
     badge_samples: int | None = None
+    badge_score_samples: int = 0
+    badge_reference_loaded: bool = False
+    badge_reference_matches: int = 0
     feed_uncertain_rows: int = 0
 
 
@@ -576,8 +579,8 @@ def kill_badge_match(frame, rows, reference=None):
 
 
 def ocr_events(path, region, reason, identify, duration, progress, *,
-               page_mode="11", stop=None, mode=OCR_MODES[0], for_ocr=None):
-    filters = "fps=2:start_time=0," + ocr_filter(region, mode)
+               page_mode="11", stop=None, mode=OCR_MODES[0], for_ocr=None, rounding="near"):
+    filters = f"fps=2:start_time=0:round={rounding}," + ocr_filter(region, mode)
     command = decode(path, "-filter_threads", "1", "-threads:v", "1")
     command += ["-map", "0:V:0", "-an", "-vf", filters, "-threads:v", "1",
                 "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
@@ -717,17 +720,20 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
     if badge:
         if diagnostics is not None:
             diagnostics.badge_samples = 0
+            diagnostics.badge_reference_loaded = feed.skull_reference is not None
 
         def badge_matches(rows, frame):
-            if kill_badge_match(frame, rows, feed.skull_reference):
-                if diagnostics is not None:
-                    diagnostics.badge_samples += 1
-                return {"KILL"}
-            return set()
+            evidence = kill_badge_match(frame, rows, feed.skull_reference)
+            if diagnostics is not None:
+                diagnostics.badge_score_samples += bool(badge_scores(rows))
+                diagnostics.badge_samples += bool(evidence)
+                diagnostics.badge_reference_matches += bool(evidence and evidence.startswith("saved skull"))
+            return {"KILL"} if evidence else set()
 
+        # Use the last source frame at or before each half-second sample.
         events.extend(ocr_events(path, KILL_BADGE_REGION, "KILL badge", badge_matches,
                                  recording.duration, progress, page_mode=KILL_BADGE_PAGE_MODE,
-                                 stop=stop, mode=KILL_BADGE_MODE, for_ocr=badge_text_frame))
+                                 stop=stop, mode=KILL_BADGE_MODE, for_ocr=badge_text_frame, rounding="up"))
     if score_pattern:
         def score_matches(rows, _frame):
             text = "\n".join(row.text for row in rows)
@@ -1063,6 +1069,7 @@ def main():
             for result in results:
                 if args.show_feed and result.badge_samples is not None:
                     print(f"{result.source.name}: KILL badge seen in {result.badge_samples} sample(s).")
+                    print(f"  Readable score in {result.badge_score_samples} sample(s).")
                 if args.show_feed and result.feed_scanned:
                     print(f"{result.source.name}: exact player name seen in {result.feed_mentions} sample(s), "
                           f"{result.feed_matches} matching current rule.")

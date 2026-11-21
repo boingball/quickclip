@@ -863,6 +863,11 @@ class Desktop:
             lines.append(result.source.name)
             if result.badge_samples is not None:
                 lines.append(f"KILL badge seen in {result.badge_samples} sample(s).")
+                lines.append(f"Readable score in {result.badge_score_samples} sample(s).")
+                if result.badge_reference_loaded:
+                    lines.append(f"Saved skull reference matched {result.badge_reference_matches} sample(s).")
+                else:
+                    lines.append("No saved skull reference was used for this scan.")
             if not result.feed_scanned:
                 lines.append("")
                 continue

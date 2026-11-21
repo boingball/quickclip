@@ -37,6 +37,8 @@ For Battlefield recordings with the **KILL** notification, set **Montage cues** 
 
 If the score is readable and the skull is visible but the test finds no match, draw a tight box around the skull in the zoomed **Skull reference** view and click **Save skull reference**. The preview checks the saved template immediately, and desktop montage scans use it for later recordings with the same HUD. **Clear reference** restores the built-in check on its own.
 
+**OCR readout** reports how many samples had a readable score and whether the desktop scan used a saved skull reference. Several matching samples can belong to one notification and produce a single clip.
+
 1. Open a recording or folder, enter your in-game name, and set the seconds before and after each kill. Set **Montage file limit** to `5` for a short trial, or leave it blank to scan the whole folder.
 2. Click **Find montage clips**. QuickClip runs Tesseract only on the kill-feed crop. It looks for the gap between names separately in each row and counts your name on the killer side. It merges overlapping moments from the same recording. Up to four recordings scan concurrently by default, and results appear as each file finishes. Adjust **Montage scan workers** to change how many run at once.
 3. Select a row and click **Play clip** to preview it in FFplay. Click its **Keep** checkbox or press **Space** on the focused row to toggle it. All candidates are checked initially.
