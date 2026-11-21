@@ -17,7 +17,8 @@ from tkinter import filedialog, messagebox, ttk
 from quickclip import (
     BatchResult, DEFAULT_MONTAGE_WORKERS, DEFAULT_SCORE, FEED, GREEN_PLAYER, KillFeedOptions, NAME_TOKEN, OCR_MODES,
     RECORDING_EXTENSIONS, export_clip, folder_recordings, parse_feed_divider, parse_feed_region, prepare_output,
-    kill_badge_match, preview_feed, preview_kill_badge, probe, process_batch, run, scan_kills, write_montage,
+    badge_scores, kill_badge_match, preview_feed, preview_kill_badge, probe, process_batch, run,
+    scan_kills, skull_search_area, write_montage,
 )
 
 MONTAGE_CUES = ("Kill feed", "KILL badge", "Both")
@@ -728,7 +729,14 @@ class Desktop:
         canvas = tk.Canvas(frame, width=photo.width(), height=photo.height(), highlightthickness=0)
         canvas.image = photo
         canvas.create_image(0, 0, image=photo, anchor="nw")
-        if split is not None:
+        scores = badge_scores(rows) if badge else []
+        if badge:
+            for score in scores:
+                canvas.create_rectangle(*(coord / 2 for coord in skull_search_area(score)),
+                                        outline="#ffe15c", width=2)
+                canvas.create_rectangle(score.left / 2, score.top / 2, score.right / 2,
+                                        (score.top + score.height) / 2, outline="#53d4ff", width=2)
+        elif split is not None:
             canvas.create_line(split / 2, 0, split / 2, photo.height(), fill="#1675a4", width=2, dash=(5, 3))
         else:
             for row in rows:
@@ -746,6 +754,9 @@ class Desktop:
             detail.insert("end", f"KILL badge · {verdict} on this frame\n\n")
             if evidence:
                 detail.insert("end", f"Matched by {evidence}.\n\n")
+            if scores:
+                score_text = ", ".join(score.text for score in scores)
+                detail.insert("end", f"Score read · {score_text}\nBlue outlines the score. Yellow marks the skull search area.\n\n")
         if rows:
             for row in rows:
                 if badge:

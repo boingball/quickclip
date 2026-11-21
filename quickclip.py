@@ -170,8 +170,9 @@ OCR_LOOKALIKES = ("o0", "il1", "s5", "b8", "z2")
 GREEN_PLAYER = "Green player"
 FAINT_TEXT = "Faint text"
 OCR_MODES = ("Grayscale", "Bright text", "Colored HUD", GREEN_PLAYER, FAINT_TEXT)
-KILL_BADGE_MODE = OCR_MODES[1]
+KILL_BADGE_MODE = OCR_MODES[0]
 KILL_BADGE_PAGE_MODE = "11"
+KILL_BADGE_TEXT_LUT = bytes(0 if value >= 175 else 255 for value in range(256))
 OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored", "green", "faint"), OCR_MODES))
 OCR_WIDTH, OCR_HEIGHT = 960, 480
 OCR_HEADER = f"P5\n{OCR_WIDTH} {OCR_HEIGHT}\n255\n".encode("ascii")
@@ -372,7 +373,7 @@ def read_ocr_frame(frame, page_mode, environment, mode):
     return tuple(OCRRow(tuple(words)) for words in lines.values())
 
 
-def preview_ocr_frame(path, seconds, region, mode, page_mode):
+def preview_ocr_frame(path, seconds, region, mode, page_mode, *, for_ocr=None):
     pixels = run(["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{seconds:.3f}",
                   "-filter_threads", "1", "-threads:v", "1", "-i", str(path), "-map", "0:V:0",
                   "-an", "-frames:v", "1", "-vf", ocr_filter(region, mode), "-threads:v", "1",
@@ -380,7 +381,8 @@ def preview_ocr_frame(path, seconds, region, mode, page_mode):
     if len(pixels) != OCR_WIDTH * OCR_HEIGHT:
         raise ValueError("No preview frame at that time. Try an earlier frame.")
     image = OCR_HEADER + pixels
-    rows = read_ocr_frame(image, page_mode, {**os.environ, "OMP_THREAD_LIMIT": "1"}, mode)
+    ocr_image = for_ocr(image) if for_ocr else image
+    rows = read_ocr_frame(ocr_image, page_mode, {**os.environ, "OMP_THREAD_LIMIT": "1"}, mode)
     return image, rows
 
 
@@ -391,8 +393,13 @@ def preview_feed(path, seconds, region, mode, divider=None):
 
 
 def preview_kill_badge(path, seconds):
-    image, rows = preview_ocr_frame(path, seconds, KILL_BADGE_REGION, KILL_BADGE_MODE, KILL_BADGE_PAGE_MODE)
+    image, rows = preview_ocr_frame(path, seconds, KILL_BADGE_REGION, KILL_BADGE_MODE,
+                                    KILL_BADGE_PAGE_MODE, for_ocr=badge_text_frame)
     return image, rows, None
+
+
+def badge_text_frame(frame):
+    return OCR_HEADER + frame[len(OCR_HEADER):].translate(KILL_BADGE_TEXT_LUT)
 
 
 def connected_pixels(points):
@@ -441,17 +448,35 @@ def skull_shape(component, score_height):
                for x1, y1 in eyes for x2, y2 in eyes)
 
 
-def skull_next_to_score(frame, score):
+def skull_search_area(score):
     height = score.height
     left = max(0, score.left - round(3 * height))
-    right = score.left - max(1, round(.15 * height))
+    right = max(left, score.left - max(1, round(.15 * height)))
     top = max(0, score.top - height // 2)
     bottom = min(OCR_HEIGHT, score.top + round(1.55 * height))
-    ink = set()
-    for y in range(top, bottom):
-        offset = len(OCR_HEADER) + y * OCR_WIDTH
-        ink.update((x, y) for x in range(left, right) if frame[offset + x] < 128)
-    return any(skull_shape(component, height) for component in connected_pixels(ink))
+    return left, top, right, bottom
+
+
+def skull_next_to_score(frame, score):
+    left, top, right, bottom = skull_search_area(score)
+    samples = [
+        (x, y, frame[len(OCR_HEADER) + y * OCR_WIDTH + x])
+        for y in range(top, bottom) for x in range(left, right)
+    ]
+    previous = None
+    # Lower the cutoff only in the small area to the left of the score.
+    for cutoff in (175, 165, 155, 145, 135, 125, 115):
+        ink = {(x, y) for x, y, value in samples if value >= cutoff}
+        if ink != previous and any(skull_shape(part, score.height) for part in connected_pixels(ink)):
+            return True
+        previous = ink
+    return False
+
+
+def badge_scores(rows):
+    return [word for row in rows for word in row.words
+            if word.confidence >= 70 and 8 <= word.height <= OCR_HEIGHT // 6
+            and re.fullmatch(r"[0-9]{2,4}", word.text)]
 
 
 def kill_badge_match(frame, rows):
@@ -459,17 +484,14 @@ def kill_badge_match(frame, rows):
         return "boxed KILL text"
     if any(re.search(r"\bKILL\s+ASSIST\b", row.text, re.IGNORECASE) for row in rows):
         return None
-    for row in rows:
-        for word in row.words:
-            if (word.confidence >= 70 and word.height >= 8
-                    and re.fullmatch(r"[0-9]{2,4}", word.text)
-                    and skull_next_to_score(frame, word)):
-                return f"skull beside score {word.text}"
+    for word in badge_scores(rows):
+        if skull_next_to_score(frame, word):
+            return f"skull beside score {word.text}"
     return None
 
 
 def ocr_events(path, region, reason, identify, duration, progress, *,
-               page_mode="11", stop=None, mode=OCR_MODES[0]):
+               page_mode="11", stop=None, mode=OCR_MODES[0], for_ocr=None):
     filters = "fps=2:start_time=0," + ocr_filter(region, mode)
     command = decode(path, "-filter_threads", "1", "-threads:v", "1")
     command += ["-map", "0:V:0", "-an", "-vf", filters, "-threads:v", "1",
@@ -488,7 +510,8 @@ def ocr_events(path, region, reason, identify, duration, progress, *,
                 progress(f"Scanning {reason.lower()} at {timestamp:.0f} / {duration:.0f}s")
             if data != last_frame:
                 frame = OCR_HEADER + data
-                rows = read_ocr_frame(frame, page_mode, tesseract_env, mode)
+                ocr_frame = for_ocr(frame) if for_ocr else frame
+                rows = read_ocr_frame(ocr_frame, page_mode, tesseract_env, mode)
                 last_frame = data
             matches = identify(rows, frame)
             previous = set().union(*recent)
@@ -619,7 +642,7 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
 
         events.extend(ocr_events(path, KILL_BADGE_REGION, "KILL badge", badge_matches,
                                  recording.duration, progress, page_mode=KILL_BADGE_PAGE_MODE,
-                                 stop=stop, mode=KILL_BADGE_MODE))
+                                 stop=stop, mode=KILL_BADGE_MODE, for_ocr=badge_text_frame))
     if score_pattern:
         def score_matches(rows, _frame):
             text = "\n".join(row.text for row in rows)
