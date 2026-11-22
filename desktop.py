@@ -79,6 +79,8 @@ class Desktop:
         self.recording_dates = {}
         self.thumbnail_task = None
         self.thumbnail_version = 0
+        self.settings_requested = True
+        self.layout_height = 0
         self.audio_lookup = set()
         self.input_path = None
         self.default_output = None
@@ -125,7 +127,7 @@ class Desktop:
 
         root.title("QuickClip")
         root.minsize(720, 460)
-        body = ttk.Frame(root, padding=16)
+        body = ttk.Frame(root, padding=10)
         body.pack(fill="both", expand=True)
         file_row = ttk.Frame(body)
         file_row.pack(fill="x")
@@ -133,6 +135,8 @@ class Desktop:
         self.open_button.pack(side="left")
         self.folder_button = ttk.Button(file_row, text="Open folder…", command=self.open_folder)
         self.folder_button.pack(side="left", padx=(8, 0))
+        self.settings_button = ttk.Button(file_row, text="Hide settings", command=self.toggle_settings)
+        self.settings_button.pack(side="right")
         ttk.Label(file_row, textvariable=self.filename).pack(side="left", padx=10)
         output_row = ttk.Frame(body)
         output_row.pack(fill="x", pady=(8, 0))
@@ -145,8 +149,8 @@ class Desktop:
         self.date_button.pack(side="left")
         ttk.Label(date_row, textvariable=self.date_range_label, wraplength=720).pack(side="left", padx=10)
 
-        settings = ttk.LabelFrame(body, text="Highlight detection", padding=10)
-        settings.pack(fill="x", pady=12)
+        self.settings = settings = ttk.LabelFrame(body, text="Highlight and export settings", padding=6)
+        settings.pack(fill="x", pady=(8, 4))
         settings.columnconfigure(1, weight=1)
         settings.columnconfigure(3, weight=1)
         self.track = ttk.Combobox(settings, state="readonly", values=("Auto", "Off"))
@@ -159,6 +163,9 @@ class Desktop:
         self.montage_limit = ttk.Entry(settings, width=8)
         self.montage_workers = ttk.Entry(settings, width=8)
         self.montage_workers.insert(0, str(DEFAULT_MONTAGE_WORKERS))
+        self.montage_format = ttk.Combobox(settings, state="readonly", values=("MKV", "MP4"), width=7)
+        self.montage_format.current(0)
+        self.mic_mix_track = ttk.Entry(settings, width=8)
         for field, value in ((self.threshold, "-18"), (self.before, "10"), (self.after, "6")):
             field.insert(0, value)
         settings_fields = (
@@ -168,83 +175,116 @@ class Desktop:
             ("Seconds before", self.before, 1, 2),
             ("Score text pattern", ttk.Entry(settings, textvariable=self.score), 2, 0),
             ("Seconds after", self.after, 2, 2),
+            ("Montage file limit", self.montage_limit, 3, 0),
+            ("Montage scan workers", self.montage_workers, 3, 2),
             ("Export audio offset (ms)", self.audio_offset, 4, 0),
-            ("Montage file limit (optional)", self.montage_limit, 5, 0),
-            ("Montage scan workers", self.montage_workers, 6, 0),
+            ("Montage format", self.montage_format, 8, 0),
+            ("Mix mic track (optional)", self.mic_mix_track, 8, 2),
         )
         for label, field, row, column in settings_fields:
             ttk.Label(settings, text=label).grid(row=row, column=column, sticky="w", padx=(0, 8))
-            field.grid(row=row, column=column + 1, sticky="ew", padx=(0, 12), pady=3)
+            field.grid(row=row, column=column + 1,
+                       sticky="ew" if row <= 2 and column == 0 else "w", padx=(0, 12), pady=2)
         ttk.Checkbutton(settings, text="Detect score popups", variable=self.score_enabled).grid(
-            row=3, column=1, sticky="w")
-        self.scan_button = ttk.Button(settings, text="Find highlights", command=self.start_scan, state="disabled")
-        self.scan_button.grid(row=3, column=3, sticky="e")
-        self.batch_button = ttk.Button(settings, text="Scan and export all",
-                                       command=lambda: self.start_scan(auto_export=True))
-        self.batch_button.grid(row=4, column=3, sticky="e", pady=(4, 0))
-        self.montage_button = ttk.Button(settings, text="Find montage clips",
-                                         command=lambda: self.start_scan(montage=True))
-        self.montage_button.grid(row=5, column=3, sticky="e", pady=(4, 0))
-        self.crop_button = ttk.Button(settings, text="Set kill-feed area…", command=self.configure_feed)
-        self.crop_button.grid(row=6, column=3, sticky="e", pady=(4, 0))
+            row=5, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(settings, text="Match name anywhere in feed", variable=self.any_feed_mention).grid(
-            row=7, column=0, columnspan=2, sticky="w")
+            row=5, column=2, columnspan=2, sticky="w")
         ttk.Checkbutton(settings, text="Use loud audio if no kill matches", variable=self.audio_fallback).grid(
-            row=7, column=2, columnspan=2, sticky="w")
-        ttk.Label(settings, text="Montage cues").grid(row=8, column=0, sticky="w")
+            row=6, column=0, columnspan=2, sticky="w")
+        ttk.Label(settings, text="Montage cues").grid(row=4, column=2, sticky="w")
         ttk.Combobox(settings, textvariable=self.montage_cue, values=MONTAGE_CUES,
-                     state="readonly").grid(row=8, column=1, sticky="ew", padx=(0, 12), pady=3)
+                     state="readonly", width=20).grid(row=4, column=3, sticky="w", padx=(0, 12), pady=2)
         ttk.Checkbutton(settings, text="Radeon hardware encoding", variable=self.radeon_encode).grid(
-            row=9, column=0, columnspan=2, sticky="w")
+            row=7, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(settings, text="Radeon hardware decoding", variable=self.radeon_decode).grid(
-            row=9, column=2, columnspan=2, sticky="w")
+            row=6, column=2, columnspan=2, sticky="w")
         shutdown = ttk.Checkbutton(settings, text="Shut down PC after montage", variable=self.shutdown_when_finished)
-        shutdown.grid(row=10, column=0, columnspan=2, sticky="w")
+        shutdown.grid(row=7, column=2, columnspan=2, sticky="w")
         if not self.can_shutdown:
             shutdown.state(["disabled"])
-        self.resume_scan_button = ttk.Button(settings, text="Resume replay scan", command=self.resume_saved_scan)
-        self.resume_scan_button.grid(row=10, column=3, sticky="e")
+        self.review_toolbar = toolbar = ttk.Frame(body)
+        toolbar.pack(fill="x", pady=(2, 6))
+        self.montage_button = ttk.Button(toolbar, text="Find montage clips",
+                                         command=lambda: self.start_scan(montage=True))
+        self.scan_button = ttk.Button(toolbar, text="Find highlights", command=self.start_scan)
+        self.batch_button = ttk.Button(toolbar, text="Scan and export all",
+                                       command=lambda: self.start_scan(auto_export=True))
+        self.crop_button = ttk.Button(toolbar, text="Set kill-feed area…", command=self.configure_feed)
+        self.resume_scan_button = ttk.Button(toolbar, text="Resume replay scan", command=self.resume_saved_scan)
+        for button in (self.montage_button, self.scan_button, self.batch_button,
+                       self.crop_button, self.resume_scan_button):
+            button.pack(side="left", padx=(0, 5))
 
-        results = ttk.Frame(body)
-        results.pack(fill="both", expand=True)
-        self.result_columns = ("source", "start", "end", "audio", "reasons", "details")
+        review = ttk.PanedWindow(body, orient="horizontal")
+        results = ttk.Frame(review)
+        results.rowconfigure(0, weight=1)
+        results.columnconfigure(0, weight=1)
+        self.result_columns = ("source", "start", "end", "audio", "reasons", "details", "awards")
         self.table = ttk.Treeview(results, columns=("keep", *self.result_columns),
                                   displaycolumns=self.result_columns, show="headings")
         self.table.heading("keep", text="Keep")
         self.table.column("keep", width=58, anchor="center", stretch=False)
         for name, title, width in (("source", "Recording", 230), ("start", "Start", 85),
                                    ("end", "End", 85), ("audio", "Audio", 74),
-                                   ("reasons", "Detected by", 128), ("details", "Weapon / target", 130)):
+                                   ("reasons", "Detected by", 128), ("details", "Weapon / target", 150),
+                                   ("awards", "Awards", 120)):
             self.table.heading(name, text=title)
-            self.table.column(name, width=width, stretch=name in ("source", "reasons", "details"))
+            self.table.column(name, width=width, stretch=name in ("source", "reasons", "details", "awards"))
         scrollbar = ttk.Scrollbar(results, orient="vertical", command=self.table.yview)
-        self.table.configure(yscrollcommand=scrollbar.set)
-        scrollbar.pack(side="right", fill="y")
-        self.table.pack(side="left", fill="both", expand=True)
+        horizontal = ttk.Scrollbar(results, orient="horizontal", command=self.table.xview)
+        self.table.configure(yscrollcommand=scrollbar.set, xscrollcommand=horizontal.set)
+        scrollbar.grid(row=0, column=1, sticky="ns")
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.table.grid(row=0, column=0, sticky="nsew")
         self.table.bind("<<TreeviewSelect>>", self.select_clip)
         self.table.bind("<Button-1>", self.click_keep)
         self.table.bind("<Double-1>", self.double_click)
         self.table.bind("<space>", self.toggle_focused)
 
-        self.preview_strip = ttk.LabelFrame(body, text="Selected clip frames", padding=6)
-        self.thumbnail_labels = [ttk.Label(self.preview_strip, compound="top", anchor="center") for _ in range(3)]
+        review.add(results, weight=1)
+        self.preview_strip = ttk.LabelFrame(review, text="Selected clip", padding=8, width=226)
+        self.preview_title = tk.StringVar(value="Select a clip to see its frames")
+        ttk.Label(self.preview_strip, textvariable=self.preview_title, wraplength=205).pack(fill="x")
+        self.preview_button = ttk.Button(self.preview_strip, text="Play clip", command=self.preview)
+        self.preview_button.pack(anchor="w", pady=(6, 6))
+        preview_canvas = tk.Canvas(self.preview_strip, highlightthickness=0, width=200, height=135,
+                                   yscrollincrement=24,
+                                   background=ttk.Style(root).lookup("TFrame", "background"))
+        preview_scroll = ttk.Scrollbar(self.preview_strip, orient="vertical", command=preview_canvas.yview)
+        preview_canvas.configure(yscrollcommand=preview_scroll.set)
+        preview_scroll.pack(side="right", fill="y")
+        preview_canvas.pack(side="left", fill="both", expand=True)
+        thumbnails = ttk.Frame(preview_canvas)
+        preview_window = preview_canvas.create_window((0, 0), window=thumbnails, anchor="nw")
+        thumbnails.bind("<Configure>", lambda _: preview_canvas.configure(scrollregion=preview_canvas.bbox("all")))
+        preview_canvas.bind("<Configure>", lambda event: preview_canvas.itemconfigure(preview_window, width=event.width))
+        self.preview_canvas = preview_canvas
+        self.thumbnail_labels = [ttk.Label(thumbnails, compound="top", anchor="center") for _ in range(3)]
         for label in self.thumbnail_labels:
-            label.pack(side="left", padx=6)
+            label.pack(fill="x", pady=(0, 6))
+        for widget in (preview_canvas, thumbnails, *self.thumbnail_labels):
+            widget.bind("<MouseWheel>", self.scroll_preview)
+            widget.bind("<Button-4>", self.scroll_preview)
+            widget.bind("<Button-5>", self.scroll_preview)
+        review.add(self.preview_strip, weight=0)
+
+        status = ttk.Label(body, textvariable=self.status, wraplength=680)
+        status.pack(side="bottom", fill="x", pady=(4, 0))
+        body.bind("<Configure>", lambda event: self.resize_review(event, status))
         self.actions = actions = ttk.Frame(body)
-        actions.pack(fill="x", pady=(10, 0))
-        self.preview_button = ttk.Button(actions, text="Play clip", command=self.preview)
-        self.preview_button.pack(side="left")
+        actions.pack(side="bottom", fill="x", pady=(6, 0))
         self.feed_button = ttk.Button(actions, text="OCR readout", command=self.show_feed_results)
         self.feed_button.pack(side="left", padx=(6, 0))
         self.resume_button = ttk.Button(actions, text="Resume montage", command=self.resume_montage)
         self.resume_button.pack(side="left", padx=(6, 0))
-        ttk.Label(actions, textvariable=self.keep_count).pack(side="left", padx=10)
         self.export_button = ttk.Button(actions, text="Export selected…", command=self.export)
         self.export_button.pack(side="right")
         self.build_button = ttk.Button(actions, text="Build montage", command=self.build_montage)
         self.pause_button = ttk.Button(actions, text="Pause montage", command=self.pause_montage)
         self.cancel_shutdown_button = ttk.Button(actions, text="Cancel shutdown", command=self.cancel_shutdown)
-        ttk.Label(body, textvariable=self.status, wraplength=680).pack(fill="x", pady=(10, 0))
+        self.keep_label = ttk.Label(actions, textvariable=self.keep_count)
+        self.keep_label.pack(side="left", padx=10)
+        review.pack(fill="both", expand=True)
 
         self.busy = False
         self.settings_file = settings_path()
@@ -264,6 +304,7 @@ class Desktop:
             "audio_offset": self.audio_offset,
             "montage_limit": self.montage_limit,
             "montage_workers": self.montage_workers,
+            "mic_mix_track": self.mic_mix_track,
         }
 
     def load_settings(self):
@@ -292,6 +333,8 @@ class Desktop:
             self.feed_mode.set(values["feed_mode"])
         if values.get("montage_cue") in MONTAGE_CUES:
             self.montage_cue.set(values["montage_cue"])
+        if values.get("montage_format") in self.montage_format["values"]:
+            self.montage_format.set(values["montage_format"])
         stored_reference = values.get("skull_reference")
         if isinstance(stored_reference, dict):
             try:
@@ -320,6 +363,7 @@ class Desktop:
                       any_feed_mention=self.any_feed_mention.get(), audio_fallback=self.audio_fallback.get(),
                       feed_mode=self.feed_mode.get(), feed_divider=self.feed_divider.get(),
                       fixed_feed_divider=self.fixed_feed_divider.get(), montage_cue=self.montage_cue.get(),
+                      montage_format=self.montage_format.get(),
                       from_date=self.from_date.get(), to_date=self.to_date.get(),
                       radeon_encode=self.radeon_encode.get(), radeon_decode=self.radeon_decode.get())
         if self.skull_reference is not None:
@@ -388,7 +432,7 @@ class Desktop:
         self.resume_scan_button.configure(text="Resume replay scan" if has_pending else "Restore replay review",
                                           state="normal" if can_restore and not self.busy else "disabled")
         if self.montage_pause is not None:
-            self.pause_button.pack(side="right", padx=(0, 6))
+            self.pause_button.pack(side="right", padx=(0, 6), before=self.keep_label)
             self.pause_button.configure(state="disabled" if self.montage_pause.is_set() else "normal")
         else:
             self.pause_button.pack_forget()
@@ -467,11 +511,11 @@ class Desktop:
         if montage:
             self.table.configure(displaycolumns=("keep", *self.result_columns))
             self.export_button.pack_forget()
-            self.build_button.pack(side="right")
+            self.build_button.pack(side="right", before=self.keep_label)
         else:
             self.table.configure(displaycolumns=self.result_columns)
             self.build_button.pack_forget()
-            self.export_button.pack(side="right")
+            self.export_button.pack(side="right", before=self.keep_label)
 
     def click_keep(self, event):
         if self.montage_review and self.table.identify_column(event.x) == "#1":
@@ -604,6 +648,30 @@ class Desktop:
         pick_dates(self.root, self.from_date.get(), self.to_date.get(),
                    min(dates.values()), max(dates.values()), apply)
 
+    def toggle_settings(self):
+        self.settings_requested = not bool(self.settings.winfo_manager())
+        self.show_settings(self.settings_requested)
+
+    def show_settings(self, visible):
+        if visible:
+            if not self.settings.winfo_manager():
+                self.settings.pack(fill="x", pady=(8, 4), before=self.review_toolbar)
+            self.settings_button.configure(text="Hide settings")
+        else:
+            self.settings.pack_forget()
+            self.settings_button.configure(text="Show settings")
+
+    def resize_review(self, event, status):
+        status.configure(wraplength=max(250, event.width - 24))
+        if event.height != self.layout_height:
+            self.layout_height = event.height
+            self.show_settings(self.settings_requested and event.height >= 645)
+
+    def scroll_preview(self, event):
+        direction = -1 if event.num == 4 or (event.num != 5 and event.delta > 0) else 1
+        self.preview_canvas.yview_scroll(direction, "units")
+        return "break"
+
     def select_clip(self, _):
         self.buttons()
         self.thumbnail_version += 1
@@ -611,15 +679,16 @@ class Desktop:
             self.root.after_cancel(self.thumbnail_task)
             self.thumbnail_task = None
         selected = self.table.selection()
-        if not selected:
-            self.preview_strip.pack_forget()
-            return
         for label in self.thumbnail_labels:
             label.configure(image="", text="")
             label.image = None
-        self.thumbnail_labels[0].configure(text="Loading frames…")
-        self.preview_strip.pack(fill="x", before=self.actions, pady=(6, 0))
+        self.preview_canvas.yview_moveto(0)
+        if not selected:
+            self.preview_title.set("Select a clip to see its frames")
+            return
         source, clip = self.clips[int(selected[0])]
+        self.preview_title.set(f"{source.name}\n{clock(clip.start)}–{clock(clip.end)}")
+        self.thumbnail_labels[0].configure(text="Loading frames…")
         self.thumbnail_task = self.root.after(150, self.load_thumbnails, self.thumbnail_version, source, clip)
 
     def load_thumbnails(self, version, source, clip):
@@ -1335,10 +1404,11 @@ class Desktop:
             tracks = result.audio_tracks
             audio = "Unknown" if tracks is None else ("No audio" if tracks == 0 else f"{tracks} track(s)")
             details = [reason for reason in clip.reasons if reason.startswith(("Weapon: ", "Target: ", "Victim: "))]
-            cues = [reason for reason in clip.reasons if reason not in details]
+            awards = [reason.removeprefix("Award: ") for reason in clip.reasons if reason.startswith("Award: ")]
+            cues = [reason for reason in clip.reasons if reason not in details and not reason.startswith("Award: ")]
             self.table.insert("", "end", iid=str(index), values=(
                 ("☑" if keep else "☐") if self.montage_review else "", result.source.name, clock(clip.start),
-                clock(clip.end), audio, ", ".join(cues), ", ".join(details) or "Unknown"))
+                clock(clip.end), audio, ", ".join(cues), ", ".join(details) or "Unknown", ", ".join(awards)))
         if self.montage_review and first == 0 and self.clips:
             self.table.selection_set("0")
             self.table.focus("0")
@@ -1346,6 +1416,9 @@ class Desktop:
     def build_montage(self):
         try:
             audio_offset = self.read_audio_offset()
+            mic_mix = self.mic_mix_track.get().strip()
+            if mic_mix and (not re.fullmatch(r"[0-9]+", mic_mix) or int(mic_mix) < 1):
+                raise ValueError("Enter a positive mic track number for the montage mix, or leave it blank.")
         except ValueError as error:
             messagebox.showerror("QuickClip", str(error))
             return
@@ -1355,7 +1428,10 @@ class Desktop:
         clips = [self.clips[index] for index in sorted(self.kept)]
         candidates = [BatchResult(source, [clip for _, clip in group], [], [])
                       for source, group in groupby(clips, key=lambda item: item[0])]
-        self.start_montage_export(directory, lambda: save_montage_job(self.sources, candidates, directory, audio_offset))
+        output_format = self.montage_format.get().lower()
+        self.start_montage_export(directory, lambda: save_montage_job(
+            self.sources, candidates, directory, audio_offset,
+            output_format=output_format, mic_mix_track=int(mic_mix) if mic_mix else None))
 
     def resume_montage(self):
         directory = self.output or self.default_output
@@ -1404,7 +1480,7 @@ class Desktop:
             self.cancel_shutdown()
             return
         if seconds > 0:
-            self.cancel_shutdown_button.pack(side="right", padx=(0, 6))
+            self.cancel_shutdown_button.pack(side="right", padx=(0, 6), before=self.keep_label)
             self.status.set(f"Montage saved. Windows will shut down in {seconds}s.")
             self.shutdown_task = self.root.after(1000, self.start_shutdown_countdown, seconds - 1)
             return

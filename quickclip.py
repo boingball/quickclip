@@ -265,6 +265,7 @@ def microphone_events(levels, threshold, duration, reason, progress, *, stop=Non
 FEED = (.42, .30, .58, .0)
 SCORE = (.44, .38, .28, .34)
 KILL_BADGE_REGION = (.48, .20, .16, .60)
+KILL_AWARD_REGION = (.34, .15, .19, .53)
 KILL_BADGE_PATTERN = re.compile(r"\bKILL\b(?!\s+ASSIST\b)", re.IGNORECASE)
 DEFAULT_SCORE = r"\+\s*[0-9]{2,5}\b|\b[0-9]{2,5}\s*XP\b"
 NAME_TOKEN = re.compile(r"(?=[\w.-]*[^\W\d_])[\w.-]{3,32}")
@@ -845,6 +846,34 @@ def badge_scores(rows):
             and re.fullmatch(r"[0-9]{2,4}", word.text)]
 
 
+def kill_awards(rows):
+    awards = set()
+    for row in rows:
+        text = row.text.upper()
+        awards.update(re.findall(r"\b(?:BALLISTIC|FLYING ACE)\b", text))
+        for index, word in enumerate(row.words[:-1]):
+            pair = row.words[index:index + 2]
+            if " ".join(part.text.upper() for part in pair) != "NEW BEST":
+                continue
+            best = pair[-1]
+            titles = []
+            for candidate in rows:
+                first = candidate.words[0]
+                if (0 <= first.top - best.top <= 3 * best.height
+                        and abs(first.left - word.left) <= 2 * best.height
+                        and candidate is not row):
+                    titles.append(candidate.words)
+            if row.words[index + 2:]:
+                titles.append(row.words[index + 2:])
+            for title in titles:
+                name = " ".join(part.text for part in title).upper()
+                if (all(part.confidence >= 55 for part in title)
+                        and re.fullmatch(r"[A-Z][A-Z' -]{2,39}", name)
+                        and not re.search(r"\b(?:KILL|DESTROYED|NEW BEST)\b", name)):
+                    awards.add(name)
+    return awards
+
+
 def kill_badge_match(frame, rows, reference=None):
     if any(KILL_BADGE_PATTERN.search(row.text) for row in rows):
         return "boxed KILL text"
@@ -1029,8 +1058,25 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
             return {"KILL"} if evidence else set()
 
         def describe_target(rows, _frame, _matches, timestamp):
+            awards = kill_awards(rows)
+            if not awards:
+                for seconds in (timestamp, timestamp + .5):
+                    if seconds >= recording.duration or (stop is not None and stop.is_set()):
+                        break
+                    try:
+                        _, award_rows = preview_ocr_frame(path, seconds, KILL_AWARD_REGION, KILL_BADGE_MODE, "11")
+                        awards = kill_awards(award_rows)
+                    except (OSError, RuntimeError, ValueError) as error:
+                        progress(f"Could not read awards at {seconds:.2f}s. {error}")
+                        break
+                    if awards:
+                        break
+            for award in sorted(awards):
+                yield f"Award: {award}"
             positioned = position_feed_rows(rows, None)
-            if any(re.search(r"\bHELICOPTER\s+(?:DESTROYED|KILL)\b", row.text, re.IGNORECASE)
+            if "BALLISTIC" in awards:
+                yield "Target: Helicopter (BALLISTIC)"
+            elif any(re.search(r"\bHELICOPTER\s+(?:DESTROYED|KILL)\b", row.text, re.IGNORECASE)
                    for row in positioned):
                 yield "Target: Helicopter"
             elif any(re.search(r"\bVEHICLE\s+DESTROYED\b", row.text, re.IGNORECASE) for row in positioned):
@@ -1155,7 +1201,7 @@ def encode_x264(command, streams, encoded, progress, duration):
 
 def publish_export(encoded, directory, stem):
     for suffix in range(10000):
-        destination = directory / (stem + (f"_{suffix}" if suffix else "") + ".mkv")
+        destination = directory / (stem + (f"_{suffix}" if suffix else "") + encoded.suffix)
         try:
             # Reserve the filename before moving the completed encode into place.
             destination.touch(exist_ok=False)
@@ -1421,7 +1467,7 @@ def scan_kills(sources, player, before, after, progress=print, *,
         pool.shutdown(cancel_futures=True)
 
 
-def save_montage_job(sources, candidates, output, audio_offset_ms):
+def save_montage_job(sources, candidates, output, audio_offset_ms, *, output_format="mkv", mic_mix_track=None):
     prepare_output(sources, output)
     source_order = {source: index for index, source in enumerate(sources)}
     recordings = []
@@ -1430,8 +1476,12 @@ def save_montage_job(sources, candidates, output, audio_offset_ms):
         stat = source.stat()
         recordings.append({"path": str(source), "size": stat.st_size, "modified": stat.st_mtime_ns,
                            "clips": [[clip.start, clip.end, clip.reasons] for clip in result.clips]})
-    plan = json.dumps({"version": 1, "audio_offset_ms": audio_offset_ms, "recordings": recordings},
-                      ensure_ascii=False).encode("utf-8")
+    settings = {"version": 1, "audio_offset_ms": audio_offset_ms, "recordings": recordings}
+    if output_format != "mkv":
+        settings["output_format"] = output_format
+    if mic_mix_track is not None:
+        settings["mic_mix_track"] = mic_mix_track
+    plan = json.dumps(settings, ensure_ascii=False).encode("utf-8")
     directory = output / MONTAGE_CHECKPOINTS / hashlib.sha256(plan).hexdigest()
     directory.mkdir(parents=True, exist_ok=True)
     job = directory / "job.json"
@@ -1497,10 +1547,11 @@ def resume_montage_job(job, output, progress=print, *, acceleration=VideoAcceler
             candidates.append(BatchResult(source, clips, [], []))
         results, path = write_montage([result.source for result in candidates], candidates, output, progress,
                                      audio_offset_ms=plan["audio_offset_ms"], acceleration=acceleration,
-                                     checkpoint=job.parent, stop=stop)
+                                     checkpoint=job.parent, stop=stop, output_format=plan.get("output_format", "mkv"),
+                                     mic_mix_track=plan.get("mic_mix_track"))
         if path and not any(result.errors for result in results):
             job.unlink()
-            for cached in [*job.parent.glob("*.mkv"), job.parent / "segments.txt"]:
+            for cached in [*job.parent.glob("*.mkv"), job.parent / "montage.mp4", job.parent / "segments.txt"]:
                 try:
                     cached.unlink(missing_ok=True)
                 except OSError as error:
@@ -1514,7 +1565,12 @@ def check_montage_pause(stop):
 
 
 def write_montage(sources, candidates, output, progress=print, *, audio_offset_ms=0,
-                  acceleration=VideoAcceleration(), checkpoint=None, stop=None):
+                  acceleration=VideoAcceleration(), checkpoint=None, stop=None,
+                  output_format="mkv", mic_mix_track=None):
+    if output_format not in ("mkv", "mp4"):
+        raise ValueError("Choose MKV or MP4 for the montage.")
+    if mic_mix_track is not None and mic_mix_track < 1:
+        raise ValueError("Enter a positive mic track number for the montage mix, or leave it blank.")
     prepare_output(sources, output)
     source_order = {source: index for index, source in enumerate(sources)}
     workspace = nullcontext(checkpoint) if checkpoint else tempfile.TemporaryDirectory(
@@ -1568,6 +1624,9 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
             height = max(2, first_video["height"] // 2 * 2)
             audio, orders = montage_audio_settings(segments, audio)
             progress(f"Converting mixed recordings to a {width}×{height} montage…")
+        if mic_mix_track is not None and (len(audio) < 2 or mic_mix_track > len(audio)):
+            progress(f"Montage has {len(audio)} audio track(s). Mic mix for track {mic_mix_track} skipped.")
+            mic_mix_track = None
         ready = []
         for index, (segment, order) in enumerate(zip(segments, orders), 1):
             check_montage_pause(stop)
@@ -1605,26 +1664,48 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
         progress(f"Joining montage · 0% · {len(ready)} highlight segment(s)")
         manifest = staging / "segments.txt"
         manifest.write_text("".join(f"file '{name}'\n" for name, _ in ready), encoding="ascii")
-        encoded = staging / "montage.mkv"
+        encoded = staging / f"montage.{output_format}"
         command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
-                   "-f", "concat", "-i", str(manifest), "-map", "0", "-c", "copy"]
-        for index, stream in enumerate(audio):
+                   "-f", "concat", "-i", str(manifest), "-map", "0:v:0", "-c:v", "copy"]
+        title_keys = ("title", "handler_name") if output_format == "mp4" else ("title",)
+        if mic_mix_track is not None:
+            mic = mic_mix_track - 1
+            other_tracks = [index for index in range(len(audio)) if index != mic]
+            main = next((index for index in other_tracks if audio[index].get("tags", {}).get("title", "")
+                         .casefold() in ("game", "game audio")), other_tracks[0])
+            stereo = "aformat=sample_rates=48000:channel_layouts=stereo"
+            command += ["-filter_complex",
+                        f"[0:a:{main}]{stereo}[main];[0:a:{mic}]{stereo}[mic];"
+                        "[main][mic]amix=inputs=2:duration=longest[mix]",
+                        "-map", "[mix]", "-disposition:a:0", "default"]
+            for key in title_keys:
+                command += ["-metadata:s:a:0", f"{key}=Game + mic"]
+        command += ["-map", "0:a?"]
+        if output_format == "mp4":
+            command += ["-c:a", "aac", "-b:a", "320k"]
+        else:
+            command += ["-c:a", "copy"]
+            if mic_mix_track is not None:
+                command += ["-c:a:0", "flac"]
+        for index, stream in enumerate(audio, start=int(mic_mix_track is not None)):
+            if mic_mix_track is not None:
+                command += [f"-disposition:a:{index}", "0"]
             tags = stream.get("tags", {})
-            for key in ("title", "language"):
-                command += [f"-metadata:s:a:{index}", f"{key}={tags.get(key, '')}"]
+            for key in (*title_keys, "language"):
+                command += [f"-metadata:s:a:{index}", f"{key}={tags.get('title' if key == 'handler_name' else key, '')}"]
         run_export(command + [str(encoded)], "Joining montage", progress, total_duration)
         destination = publish_export(encoded, output, "kill-montage")
-        progress("Joining montage · 100% · MKV saved")
+        progress(f"Joining montage · 100% · {output_format.upper()} saved")
         return results, destination
 
 
 def kill_montage(sources, player, before, after, output, progress=print, *,
                  audio_offset_ms=0, workers=DEFAULT_MONTAGE_WORKERS, feed=KillFeedOptions(),
-                 acceleration=VideoAcceleration()):
+                 acceleration=VideoAcceleration(), output_format="mkv", mic_mix_track=None):
     with closing(scan_kills(sources, player, before, after, progress, workers=workers,
                             feed=feed, acceleration=acceleration)) as candidates:
         return write_montage(sources, candidates, output, progress, audio_offset_ms=audio_offset_ms,
-                             acceleration=acceleration)
+                             acceleration=acceleration, output_format=output_format, mic_mix_track=mic_mix_track)
 
 
 def parse_mic_track(value):
@@ -1653,7 +1734,11 @@ def main():
     parser.add_argument("--from-date", default="", metavar="YYYY-MM-DD", help="First recording date to include.")
     parser.add_argument("--to-date", default="", metavar="YYYY-MM-DD", help="Last recording date to include.")
     parser.add_argument("--kill-montage", action="store_true",
-                        help="Join kill matches into one MKV. Requires --output and either --player or --kill-badge.")
+                        help="Join kill matches into one file. Requires --output and either --player or --kill-badge.")
+    parser.add_argument("--montage-format", choices=("mkv", "mp4"),
+                        help="Container for the joined montage (default: mkv).")
+    parser.add_argument("--mix-mic-track", type=int, metavar="N",
+                        help="Add 1-based audio track N to the default montage playback mix.")
     parser.add_argument("--kill-badge", action="store_true",
                         help="Detect Battlefield's on-screen KILL label in montage mode. Omit --player for badge only.")
     parser.add_argument("--badge-feed-details", action="store_true",
@@ -1684,6 +1769,10 @@ def main():
         parser.error("--files requires a folder and a positive whole number.")
     if args.badge_feed_details and not args.kill_montage:
         parser.error("--badge-feed-details requires --kill-montage.")
+    if (args.montage_format or args.mix_mic_track is not None) and not args.kill_montage:
+        parser.error("--montage-format and --mix-mic-track require --kill-montage.")
+    if args.mix_mic_track is not None and args.mix_mic_track < 1:
+        parser.error("--mix-mic-track requires a positive track number.")
     if args.recording is None:
         from desktop import launch
         launch()
@@ -1711,7 +1800,9 @@ def main():
                                    badge=badge, badge_feed_details=args.badge_feed_details)
             results, montage = kill_montage(sources, args.player, before, after, args.output,
                                             audio_offset_ms=args.audio_offset_ms, workers=args.workers,
-                                            feed=feed, acceleration=acceleration)
+                                            feed=feed, acceleration=acceleration,
+                                            output_format=args.montage_format or "mkv",
+                                            mic_mix_track=args.mix_mic_track)
             for result in results:
                 if args.show_feed and result.badge_samples is not None:
                     print(f"{result.source.name}: KILL badge seen in {result.badge_samples} sample(s).")

@@ -42,9 +42,11 @@ If the score is readable and the skull is visible but the test finds no match, d
 1. Open a recording or folder, enter your in-game name, and set the seconds before and after each kill. Set **Montage file limit** to `5` for a short trial, or leave it blank to scan the whole folder.
 2. Click **Find montage clips**. QuickClip runs Tesseract only on the kill-feed crop. It looks for the gap between names separately in each row and counts your name on the killer side. It merges overlapping moments from the same recording. Up to four recordings scan concurrently by default, and results appear as each file finishes. Adjust **Montage scan workers** to change how many run at once.
 3. Select a row and click **Play clip** to preview it in FFplay. Click its **Keep** checkbox or press **Space** on the focused row to toggle it. All candidates are checked initially.
-4. Choose the output folder and click **Build montage** to join the checked clips into one MKV in filename order.
+4. Choose the output folder and set **Montage format** to MKV or MP4. Click **Build montage** to join the checked clips in filename order.
 
-Select a result to see three frames from the clip. Use them to compare similar clips before keeping them. The **Audio** column lists the source track count or **No audio**.
+MP4 copies the prepared video without another encode and converts each audio track to AAC for playback compatibility. MKV keeps the prepared audio tracks as-is. Enter your audio track number in **Mix mic track (optional)** to add a default stereo game-and-mic mix while keeping the separate tracks. QuickClip uses the track named Game or Game Audio for the mix when available, or the first other track. Recordings with a missing track use silence for that track. Leave the field blank to export the original track lineup.
+
+Select a result to see three frames and the **Play clip** button in the right-hand preview panel. Drag the divider to resize the panel, and scroll through its frames if needed. Settings collapse automatically in short windows. Use **Show settings** to open them again. The **Audio** column lists the source track count or **No audio**.
 
 **Pick dates** shows the oldest and newest recording dates and offers **Today**, **Yesterday**, **This week**, and custom calendar bounds. QuickClip uses a `YYYY-MM-DD` date in the filename when available, then falls back to the file's modified date. The date filter applies before the file limit. The CLI equivalents are `--from-date` and `--to-date`.
 
@@ -52,7 +54,9 @@ For weapon hints, open **Test feed OCR** on a frame with both names readable. Dr
 
 Use **Badge + feed details** to scan the lower HUD for kills and read the normal top-right feed only around each badge hit. The icon reference follows the gap between names as it moves. QuickClip adds a victim or weapon only when it can link a single feed row to the popup's victim name or to a newly visible row with your name on the killer side. The CLI option is `--kill-montage --badge-feed-details`.
 
-Click **Pause montage** to stop after the current clip or conversion finishes. QuickClip saves completed work in the output folder. You can change the Radeon options, then click **Resume montage**, including after reopening QuickClip. Resume uses the selected clips and audio offset from the saved build. It uses the current Radeon options for work that remains.
+Badge detection also checks the award banner above the kill notification. The **Awards** column lists recognized titles such as **FLYING ACE**, **BALLISTIC**, and readable titles under **NEW BEST**. **BALLISTIC** also adds a helicopter hint in **Weapon / target**.
+
+Click **Pause montage** to stop after the current clip or conversion finishes. QuickClip saves completed work in the output folder. You can change the Radeon options, then click **Resume montage**, including after reopening QuickClip. Resume uses the selected clips, output format, mic mix, and audio offset from the saved build. It uses the current Radeon options for work that remains.
 
 QuickClip saves the replay list, completed scans and your **Keep** choices as you go. On reopening the same input, it restores the review. Click **Resume replay scan** to scan the remaining recordings using the saved detection settings. A recording with a changed file size or modification time is scanned again.
 
@@ -115,6 +119,8 @@ Use `--show-feed` to show OCR rows and `--feed-region 58,0,42,30` to set the cro
 
 For a badge-only montage, pass `--kill-montage --kill-badge --output "F:\QuickClip-Montage"`. Add `--player boingball` to scan both cues.
 
+Add `--montage-format mp4` to save an MP4 and `--mix-mic-track 2` if your mic is on audio track 2.
+
 If all audio tracks play late in an exported clip, try `--audio-offset-ms -1000` to bring them one second earlier. The desktop app has the same **Export audio offset (ms)** setting. Positive values delay audio. The offset applies to all tracks during export and defaults to zero.
 
 ## Radeon acceleration on Windows
@@ -123,6 +129,6 @@ Enable **Radeon hardware encoding** to try FFmpeg's AMD AMF H.264 encoder (`h264
 
 Use an FFmpeg build that lists `h264_amf` in `ffmpeg -encoders` and `d3d11va` in `ffmpeg -hwaccels`, with your Radeon driver installed. QuickClip falls back to CPU processing if a feature is missing or the hardware attempt fails.
 
-During exports, QuickClip displays the active encoder, frames written, output time, and speed as FFmpeg reports them. Mixed-format montages first export the clips, then convert them to a common format before joining them. The join step shows its own percentage and reaches 100% when the final MKV is saved.
+During exports, QuickClip displays the active encoder, frames written, output time, and speed as FFmpeg reports them. Mixed-format montages first export the clips, then convert them to a common format before joining them. The join step shows its own percentage and reaches 100% when the montage is saved.
 
 The command-line equivalents are `--radeon-encode` and `--radeon-decode`.
