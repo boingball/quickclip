@@ -27,7 +27,7 @@ from quickclip import (
 )
 from scan_review import SavedScan
 
-MONTAGE_CUES = ("Kill feed", "KILL badge", "Both")
+MONTAGE_CUES = ("Kill feed", "KILL badge", "Both", "Badge + feed details")
 
 
 def clock(seconds):
@@ -1103,6 +1103,8 @@ class Desktop:
                     lines.append(f"Saved skull reference matched {result.badge_reference_matches} sample(s).")
                 else:
                     lines.append("No saved skull reference was used for this scan.")
+                if result.badge_feed_matches is not None:
+                    lines.append(f"Linked to a kill-feed row · {result.badge_feed_matches} notification(s)")
             if not result.feed_scanned:
                 lines.append("")
                 continue
@@ -1213,9 +1215,10 @@ class Desktop:
                 if not resume:
                     cue = self.montage_cue.get()
                     badge = cue in MONTAGE_CUES[1:]
+                    badge_feed_details = cue == "Badge + feed details"
                     if cue == "KILL badge":
                         player = ""
-                    elif not player:
+                    elif not player and not badge_feed_details:
                         raise ValueError("Enter your player name to make a kill montage.")
                     limit = self.montage_limit.get().strip()
                     if limit:
@@ -1225,13 +1228,14 @@ class Desktop:
                     fallback = (track or "auto") if self.audio_fallback.get() else 0
                     threshold = float(self.threshold.get()) if fallback else -18
                     feed = KillFeedOptions(
-                        region=parse_feed_region(self.feed_region.get()) if player else FEED,
+                        region=parse_feed_region(self.feed_region.get()) if player or badge_feed_details else FEED,
                         any_mention=self.any_feed_mention.get(), fallback_track=fallback,
                         threshold=threshold, mode=self.feed_mode.get(), badge=badge,
                         skull_reference=self.skull_reference,
                         weapon_references=self.weapon_references,
+                        badge_feed_details=badge_feed_details,
                         divider=parse_feed_divider(self.feed_divider.get())
-                        if player and self.fixed_feed_divider.get() else None,
+                        if (player or badge_feed_details) and self.fixed_feed_divider.get() else None,
                     )
             else:
                 score = self.score.get().strip() if self.score_enabled.get() else ""
@@ -1277,7 +1281,7 @@ class Desktop:
             if montage:
                 if self.clips:
                     status += " Play clips and untick any you want to leave out."
-                if not failures and player:
+                if not failures and player and not feed.badge_feed_details:
                     if not any(NAME_TOKEN.search(line) for result in results for line in result.feed_rows):
                         status += " No confident name-like text. Use Test feed OCR in Set kill-feed area."
                     elif any(result.feed_mentions or result.feed_lookalikes for result in results) and not any(
@@ -1330,7 +1334,7 @@ class Desktop:
                 self.kept.add(index)
             tracks = result.audio_tracks
             audio = "Unknown" if tracks is None else ("No audio" if tracks == 0 else f"{tracks} track(s)")
-            details = [reason for reason in clip.reasons if reason.startswith(("Weapon: ", "Target: "))]
+            details = [reason for reason in clip.reasons if reason.startswith(("Weapon: ", "Target: ", "Victim: "))]
             cues = [reason for reason in clip.reasons if reason not in details]
             self.table.insert("", "end", iid=str(index), values=(
                 ("☑" if keep else "☐") if self.montage_review else "", result.source.name, clock(clip.start),

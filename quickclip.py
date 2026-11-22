@@ -62,6 +62,7 @@ class BatchResult:
     badge_score_samples: int = 0
     badge_reference_loaded: bool = False
     badge_reference_matches: int = 0
+    badge_feed_matches: int | None = None
     feed_uncertain_rows: int = 0
 
 
@@ -381,6 +382,7 @@ class KillFeedOptions:
     badge: bool = False
     skull_reference: SkullReference | None = None
     weapon_references: tuple[WeaponReference, ...] = ()
+    badge_feed_details: bool = False
 
 
 def parse_feed_region(text):
@@ -687,6 +689,107 @@ def recognize_weapon(frame, row, references, mode):
     return None
 
 
+def badge_victim_region(frame_size, score):
+    width, height = frame_size
+    badge_width, badge_height, badge_left, badge_top = KILL_BADGE_REGION
+    crop_width = max(1, int(width * badge_width))
+    crop_height = max(1, int(height * badge_height))
+    scale = min(OCR_WIDTH / crop_width, OCR_HEIGHT / crop_height)
+    pad_x = (OCR_WIDTH - crop_width * scale) / 2
+    pad_y = (OCR_HEIGHT - crop_height * scale) / 2
+    left = max(badge_left, badge_left + (score.left - 9 * score.height - pad_x) / (width * scale))
+    right = min(badge_left + badge_width, badge_left + (score.right + score.height - pad_x) / (width * scale))
+    top = max(badge_top, badge_top + (score.top + score.height - pad_y) / (height * scale))
+    bottom = min(badge_top + badge_height,
+                 badge_top + (score.top + 3.2 * score.height - pad_y) / (height * scale))
+    if right - left >= .01 and bottom - top >= .01:
+        return right - left, bottom - top, left, top
+    return None
+
+
+def feed_row_names(row):
+    if weapon_anchor(row) is None:
+        return (), ()
+    names = [word for word in row.words if NAME_TOKEN.fullmatch(word.text)]
+    return (tuple(word.text for word in names if row.side(word) == "left"),
+            tuple(word.text for word in names if row.side(word) == "right"))
+
+
+def badge_feed_details(path, recording, timestamp, badge_rows, player, feed, stop):
+    if stop is not None and stop.is_set():
+        return ()
+    scores = badge_scores(badge_rows)
+    victims = set()
+    if scores:
+        score = max(scores, key=lambda word: word.confidence)
+        region = badge_victim_region(recording.frame_size, score)
+        if region:
+            _, rows = preview_ocr_frame(path, timestamp, region, OCR_MODES[2], "11")
+            hud_words = {"assist", "destroyed", "equipment", "vehicle", "helicopter",
+                         "offensive", "defensive", "squad", "killstreak"}
+            victims = {word.text.casefold() for row in rows for word in row.words
+                       if word.confidence >= 55 and len(word.text) >= 5
+                       and NAME_TOKEN.fullmatch(word.text) and word.text.casefold() not in hud_words}
+    if not (player or victims):
+        return ()
+
+    green_only = feed.mode == GREEN_PLAYER
+    player_pattern = player_name_pattern(player, allow_lookalikes=green_only) if player else None
+    divider = (feed_divider_x(recording.frame_size, feed.region, feed.divider)
+               if feed.divider is not None else None)
+
+    def read_feed(seconds):
+        frame, rows = preview_ocr_frame(path, seconds, feed.region, feed.mode, "6")
+        return frame, position_feed_rows(rows, divider)
+
+    baseline = None
+    matches = {}
+    for seconds in (timestamp, timestamp + .35, timestamp - .35):
+        if stop is not None and stop.is_set():
+            return ()
+        if not 0 <= seconds < recording.duration:
+            continue
+        frame, rows = read_feed(seconds)
+        for row in rows:
+            left, right = feed_row_names(row)
+            if not (left and right):
+                continue
+            identity = tuple(" ".join(part).casefold() for part in (left, right))
+            is_player = player_pattern is not None and any(
+                side == "left" and (green or not green_only)
+                for _, side, green in row.name_sides(player_pattern)
+            )
+            is_victim = any(name.casefold() in victims for name in right)
+            if not is_victim:
+                if not is_player or timestamp < 1:
+                    continue
+                if baseline is None:
+                    _, earlier = read_feed(timestamp - 1)
+                    baseline = {tuple(" ".join(part).casefold() for part in feed_row_names(row))
+                                for row in earlier}
+                if identity in baseline:
+                    continue
+            confidence = 2 * is_victim + is_player
+            weapon = recognize_weapon(frame, row, feed.weapon_references, feed.mode)
+            if identity not in matches:
+                matches[identity] = [confidence, " ".join(right), set()]
+            match = matches[identity]
+            match[0] = max(match[0], confidence)
+            if weapon:
+                match[2].add(weapon)
+
+    if not matches:
+        return ()
+    highest = max(match[0] for match in matches.values())
+    winners = [match for match in matches.values() if match[0] == highest]
+    if len(winners) != 1:
+        return ()
+    _, victim, weapons = winners[0]
+    if len(weapons) == 1:
+        return f"Victim: {victim}", f"Weapon: {next(iter(weapons))}"
+    return (f"Victim: {victim}",)
+
+
 def make_skull_reference(frame, score, bounds):
     left, top, right, bottom = bounds
     search_left, search_top, search_right, search_bottom = skull_search_area(score)
@@ -784,7 +887,7 @@ def ocr_events(path, region, reason, identify, duration, progress, *,
             if matches - previous:
                 yield timestamp, reason
                 if describe:
-                    for detail in describe(rows, frame, matches - previous):
+                    for detail in describe(rows, frame, matches - previous, timestamp):
                         yield timestamp, detail
             recent.append(matches)
 
@@ -843,7 +946,7 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
             levels = audio_levels(path, track)
         reason = f"Mic peak (track {track})" if auto else "Mic peak"
         events.extend(microphone_events(levels, threshold, recording.duration, reason, progress))
-    if player:
+    if player and not (feed and feed.badge_feed_details):
         if diagnostics is not None:
             diagnostics.feed_scanned = True
         killer_only = feed is not None and not feed.any_mention
@@ -895,7 +998,7 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                         diagnostics.feed_rows[line] += 1
             return matches
 
-        def describe_weapons(rows, frame, new_matches):
+        def describe_weapons(rows, frame, new_matches, _timestamp):
             for row in position_feed_rows(rows, divider):
                 if row.text.casefold() not in new_matches:
                     continue
@@ -914,6 +1017,8 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         if diagnostics is not None:
             diagnostics.badge_samples = 0
             diagnostics.badge_reference_loaded = feed.skull_reference is not None
+            if feed.badge_feed_details:
+                diagnostics.badge_feed_matches = 0
 
         def badge_matches(rows, frame):
             evidence = kill_badge_match(frame, rows, feed.skull_reference)
@@ -923,12 +1028,23 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                 diagnostics.badge_reference_matches += bool(evidence and evidence.startswith("saved skull"))
             return {"KILL"} if evidence else set()
 
-        def describe_target(rows, _frame, _matches):
-            rows = position_feed_rows(rows, None)
-            if any(re.search(r"\bHELICOPTER\s+(?:DESTROYED|KILL)\b", row.text, re.IGNORECASE) for row in rows):
+        def describe_target(rows, _frame, _matches, timestamp):
+            positioned = position_feed_rows(rows, None)
+            if any(re.search(r"\bHELICOPTER\s+(?:DESTROYED|KILL)\b", row.text, re.IGNORECASE)
+                   for row in positioned):
                 yield "Target: Helicopter"
-            elif any(re.search(r"\bVEHICLE\s+DESTROYED\b", row.text, re.IGNORECASE) for row in rows):
+            elif any(re.search(r"\bVEHICLE\s+DESTROYED\b", row.text, re.IGNORECASE) for row in positioned):
                 yield "Target: Vehicle"
+            if feed.badge_feed_details:
+                progress(f"Checking kill feed near {timestamp:.2f}s…")
+                try:
+                    details = badge_feed_details(path, recording, timestamp, rows, player, feed, stop)
+                except (OSError, RuntimeError, ValueError) as error:
+                    progress(f"Could not read feed details at {timestamp:.2f}s. {error}")
+                    return
+                if diagnostics is not None:
+                    diagnostics.badge_feed_matches += bool(details)
+                yield from details
 
         # Use the last source frame at or before each half-second sample.
         events.extend(ocr_events(path, KILL_BADGE_REGION, "KILL badge", badge_matches,
@@ -1540,6 +1656,8 @@ def main():
                         help="Join kill matches into one MKV. Requires --output and either --player or --kill-badge.")
     parser.add_argument("--kill-badge", action="store_true",
                         help="Detect Battlefield's on-screen KILL label in montage mode. Omit --player for badge only.")
+    parser.add_argument("--badge-feed-details", action="store_true",
+                        help="Scan for kill badges, then read the kill feed around each hit in montage mode.")
     parser.add_argument("--workers", type=int, default=DEFAULT_MONTAGE_WORKERS,
                         help=f"Recordings to scan at once in montage mode (default {DEFAULT_MONTAGE_WORKERS}).")
     parser.add_argument("--feed-region", default="58,0,42,30", metavar="L,T,W,H",
@@ -1564,6 +1682,8 @@ def main():
     is_folder = args.recording is not None and args.recording.is_dir()
     if args.files is not None and (args.files < 1 or not is_folder):
         parser.error("--files requires a folder and a positive whole number.")
+    if args.badge_feed_details and not args.kill_montage:
+        parser.error("--badge-feed-details requires --kill-montage.")
     if args.recording is None:
         from desktop import launch
         launch()
@@ -1582,13 +1702,13 @@ def main():
             if args.output is None:
                 raise ValueError("--kill-montage requires an output folder.")
             fallback_track = (args.mic_track if args.mic_track else "auto") if args.montage_audio_fallback else 0
-            validate_detection(fallback_track, args.threshold, args.player, "", before, after,
-                               badge=args.kill_badge)
+            badge = args.kill_badge or args.badge_feed_details
+            validate_detection(fallback_track, args.threshold, args.player, "", before, after, badge=badge)
             feed = KillFeedOptions(parse_feed_region(args.feed_region), args.any_feed_mention,
                                    fallback_track, args.threshold,
                                    OCR_MODE_ARGS[args.feed_text_mode],
                                    parse_feed_divider(args.feed_divider) if args.feed_divider is not None else None,
-                                   args.kill_badge)
+                                   badge=badge, badge_feed_details=args.badge_feed_details)
             results, montage = kill_montage(sources, args.player, before, after, args.output,
                                             audio_offset_ms=args.audio_offset_ms, workers=args.workers,
                                             feed=feed, acceleration=acceleration)
@@ -1596,6 +1716,8 @@ def main():
                 if args.show_feed and result.badge_samples is not None:
                     print(f"{result.source.name}: KILL badge seen in {result.badge_samples} sample(s).")
                     print(f"  Readable score in {result.badge_score_samples} sample(s).")
+                    if result.badge_feed_matches is not None:
+                        print(f"  Linked to a kill-feed row: {result.badge_feed_matches} notification(s).")
                 if args.show_feed and result.feed_scanned:
                     print(f"{result.source.name}: exact player name seen in {result.feed_mentions} sample(s), "
                           f"{result.feed_matches} matching current rule.")

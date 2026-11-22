@@ -50,6 +50,8 @@ Select a result to see three frames from the clip. Use them to compare similar c
 
 For weapon hints, open **Test feed OCR** on a frame with both names readable. Draw a tight box around the weapon icon, enter a label such as **Rocket**, and click **Save weapon icon**. Use the same OCR treatment when scanning. QuickClip labels a weapon when it recognizes the saved icon on your killer-side row. **Both** lets the montage use this alongside badge detection. Lower HUD text such as **VEHICLE DESTROYED** can provide a target hint. A weapon icon alone cannot identify a helicopter.
 
+Use **Badge + feed details** to scan the lower HUD for kills and read the normal top-right feed only around each badge hit. The icon reference follows the gap between names as it moves. QuickClip adds a victim or weapon only when it can link a single feed row to the popup's victim name or to a newly visible row with your name on the killer side. The CLI option is `--kill-montage --badge-feed-details`.
+
 Click **Pause montage** to stop after the current clip or conversion finishes. QuickClip saves completed work in the output folder. You can change the Radeon options, then click **Resume montage**, including after reopening QuickClip. Resume uses the selected clips and audio offset from the saved build. It uses the current Radeon options for work that remains.
 
 QuickClip saves the replay list, completed scans and your **Keep** choices as you go. On reopening the same input, it restores the review. Click **Resume replay scan** to scan the remaining recordings using the saved detection settings. A recording with a changed file size or modification time is scanned again.
