@@ -58,7 +58,20 @@ Use **Badge + feed details** to scan the lower HUD for kills and read the normal
 
 Badge detection also checks the award banner above the kill notification. The **Awards** column lists recognized titles such as **FLYING ACE**, **BALLISTIC**, and readable titles under **NEW BEST**. **BALLISTIC** also adds a helicopter hint in **Weapon / target**.
 
-Click **Pause montage** to stop after the current clip or conversion finishes. QuickClip saves completed work in the output folder. You can change the Radeon options, then click **Resume montage**, including after reopening QuickClip. Resume uses the selected clips, output format, mic mix, and audio offset from the saved build. It uses the current Radeon options for work that remains.
+### Montage style: transitions, TikTok, slow motion, and mic at kills
+
+These options make a finished, share-ready montage. With all of them off, QuickClip joins clips exactly as above.
+
+- **Montage transition**: **Flip** folds each clip to a vertical line and unfolds the next one like a turning card. **Whip pan** slides the next clip in with motion blur. **Zoom punch** zooms into the cut. **Flash** cuts through white. **Pixelate** and **Slide** are subtler. **Random** uses every transition once, in a shuffled order, before repeating one. Transitions last 0.4 seconds, and the game audio crossfades with them.
+- **Vertical for TikTok**: makes a 1080×1920 montage for TikTok, YouTube Shorts, and Reels. **9:16 blurred fill** shows the whole picture over a blurred, zoomed copy of itself. **9:16 centre crop** fills the screen with the middle of the picture, which includes the crosshair and the KILL badge but not the kill feed or minimap. The file is named `kill-montage-vertical`.
+- **Slow motion on multi-kills**: plays two or more kills within three seconds of each other at half speed, from just before the first kill to just after the last. The audio slows down with the picture.
+- **Mic only around kills**: mixes the track in **Mix mic track** into the game audio from 1 second before each kill to 2.5 seconds after, and keeps it silent the rest of the time. Without this option, the mic plays throughout.
+
+A styled montage has one audio track (game, plus your mic when **Mix mic track** is set), because TikTok, YouTube, and phones play only the first track. HDR recordings, such as Battlefield 6's 10-bit HLG captures, are tone mapped to standard range so colours look right on phones and social sites. That needs an FFmpeg build with `zscale`, which the common Windows builds include. Without it, the montage keeps the recording's HDR colour tags.
+
+Styling re-encodes the picture once. Each transition is encoded separately and the pieces are joined without another encode, so long montages don't take disproportionately longer. **Radeon hardware encoding** speeds this up a lot. Slow motion and mic-at-kills use the kill times from the scan, so they need clips found by **Find montage clips**, not clips added by hand.
+
+Click **Pause montage** to stop after the current clip or conversion finishes. QuickClip saves completed work in the output folder. You can change the Radeon options, then click **Resume montage**, including after reopening QuickClip. Resume uses the selected clips, output format, mic mix, montage style, and audio offset from the saved build. It uses the current Radeon options for work that remains.
 
 QuickClip saves the replay list, completed scans and your **Keep** choices as you go. On reopening the same input, it restores the review. Click **Resume replay scan** to scan the remaining recordings using the saved detection settings. A recording with a changed file size or modification time is scanned again.
 
@@ -123,7 +136,7 @@ The command uses three seconds before and two after each match by default. Overr
 Add `--files 5` to try the first five recordings in filename order. This limits the number of source files scanned. Each recording can still yield multiple highlights.
 Use `--workers 2` to scan two recordings at a time, or `--workers 1` to scan sequentially.
 
-Use `--show-feed` to show OCR rows and `--feed-region 58,0,42,30` to set the crop as left, top, width, and height percentages. Use `--feed-divider 50` to override per-row detection with a fixed split halfway across the crop. Use `--feed-text-mode colored` to isolate saturated lettering, `--feed-text-mode local` for translucent feeds such as Battlefield 6, `--any-feed-mention` for looser matching, and `--montage-audio-fallback` to check loud audio when a recording has no kill matches.
+Use `--show-feed` to show OCR rows and `--feed-region 58,0,42,30` to set the crop as left, top, width, and height percentages. Use `--feed-divider 50` to override per-row detection with a fixed split halfway across the crop. Use `--feed-text-mode colored` to isolate saturated lettering, `--feed-text-mode local` for translucent feeds such as Battlefield 6, `--any-feed-mention` for looser matching, and `--montage-audio-fallback` to check loud audio when a recording has no kill matches. For a styled montage, add `--transition flip` (or `whip-pan`, `zoom-punch`, `flash`, `pixelate`, `slide`, `random`), `--vertical blur` or `--vertical crop`, `--slowmo-multikills`, and `--mic-at-kills` with `--mix-mic-track N`.
 
 For a badge-only montage, pass `--kill-montage --kill-badge --output "F:\QuickClip-Montage"`. Add `--player boingball` to scan both cues.
 

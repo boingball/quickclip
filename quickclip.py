@@ -5,11 +5,12 @@ from collections import Counter, deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing, contextmanager, nullcontext
 import csv
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from functools import lru_cache
 import hashlib
 from itertools import islice
+from random import Random
 import json
 import math
 import os
@@ -34,6 +35,8 @@ class Clip:
     start: float
     end: float
     reasons: tuple[str, ...]
+    # (time in the recording, reason) for each detection inside the clip.
+    cues: tuple[tuple[float, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -940,6 +943,7 @@ def kill_badge_match(frame, rows, reference=None):
 
 
 KILL_ID_SEPARATOR = "\x00"
+KILL_COUNT_PREFIX = "Kills: "
 
 
 class KillTracker:
@@ -1012,9 +1016,9 @@ def find_clips(events, duration, before, after):
         if clips and start <= clips[-1].end:
             last = clips[-1]
             clips[-1] = Clip(last.start, max(last.end, end),
-                             tuple(sorted(set(last.reasons) | {reason})))
+                             tuple(sorted(set(last.reasons) | {reason})), last.cues + ((timestamp, reason),))
         else:
-            clips.append(Clip(start, end, (reason,)))
+            clips.append(Clip(start, end, (reason,), ((timestamp, reason),)))
     return clips
 
 
@@ -1112,7 +1116,13 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                 return matches
             return kills.update(killer_rows)
 
-        def describe_weapons(rows, frame, new_matches, _timestamp):
+        def describe_feed(rows, frame, new_matches, _timestamp):
+            if len(new_matches) > 1:
+                yield f"{KILL_COUNT_PREFIX}{len(new_matches)}"
+            if feed.weapon_references:
+                yield from describe_weapons(rows, frame, new_matches)
+
+        def describe_weapons(rows, frame, new_matches):
             new_lines = {match.split(KILL_ID_SEPARATOR)[0] for match in new_matches}
             for row in position_feed_rows(rows, divider):
                 if row.text.casefold() not in new_lines:
@@ -1127,7 +1137,7 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                                  recording.duration, progress, page_mode="6" if feed else "11",
                                  stop=stop, mode=feed.mode if feed else OCR_MODES[0],
                                  hardware_decode=acceleration.decode,
-                                 describe=describe_weapons if feed and feed.weapon_references else None))
+                                 describe=describe_feed if feed else None))
     if badge:
         if diagnostics is not None:
             diagnostics.badge_samples = 0
@@ -1459,6 +1469,7 @@ class MontageSegment:
     layout: list[dict]
     duration: float
     result: BatchResult
+    clip: Clip = None
 
 
 def audio_slot_order(streams, preferred):
@@ -1553,7 +1564,8 @@ def scan_kills(sources, player, before, after, progress=print, *,
         pool.shutdown(cancel_futures=True)
 
 
-def save_montage_job(sources, candidates, output, audio_offset_ms, *, output_format="mkv", mic_mix_track=None):
+def save_montage_job(sources, candidates, output, audio_offset_ms, *, output_format="mkv", mic_mix_track=None,
+                     style=None):
     prepare_output(sources, output)
     source_order = {source: index for index, source in enumerate(sources)}
     recordings = []
@@ -1561,12 +1573,14 @@ def save_montage_job(sources, candidates, output, audio_offset_ms, *, output_for
         source = result.source.resolve()
         stat = source.stat()
         recordings.append({"path": str(source), "size": stat.st_size, "modified": stat.st_mtime_ns,
-                           "clips": [[clip.start, clip.end, clip.reasons] for clip in result.clips]})
+                           "clips": [[clip.start, clip.end, clip.reasons, clip.cues] for clip in result.clips]})
     settings = {"version": 1, "audio_offset_ms": audio_offset_ms, "recordings": recordings}
     if output_format != "mkv":
         settings["output_format"] = output_format
     if mic_mix_track is not None:
         settings["mic_mix_track"] = mic_mix_track
+    if style is not None and style.active:
+        settings["style"] = asdict(style)
     plan = json.dumps(settings, ensure_ascii=False).encode("utf-8")
     directory = output / MONTAGE_CHECKPOINTS / hashlib.sha256(plan).hexdigest()
     directory.mkdir(parents=True, exist_ok=True)
@@ -1629,12 +1643,15 @@ def resume_montage_job(job, output, progress=print, *, acceleration=VideoAcceler
             stat = source.stat()
             if (stat.st_size, stat.st_mtime_ns) != (recording["size"], recording["modified"]):
                 raise ValueError(f"{source.name} changed since this montage started. Build a new montage for that recording.")
-            clips = [Clip(start, end, tuple(reasons)) for start, end, reasons in recording["clips"]]
+            clips = [Clip(item[0], item[1], tuple(item[2]),
+                          tuple((float(time), str(reason)) for time, reason in (item[3] if len(item) > 3 else ())))
+                     for item in recording["clips"]]
             candidates.append(BatchResult(source, clips, [], []))
         results, path = write_montage([result.source for result in candidates], candidates, output, progress,
                                      audio_offset_ms=plan["audio_offset_ms"], acceleration=acceleration,
                                      checkpoint=job.parent, stop=stop, output_format=plan.get("output_format", "mkv"),
-                                     mic_mix_track=plan.get("mic_mix_track"))
+                                     mic_mix_track=plan.get("mic_mix_track"),
+                                     style=MontageStyle(**plan["style"]) if plan.get("style") else None)
         if path and not any(result.errors for result in results):
             job.unlink()
             for cached in [*job.parent.glob("*.mkv"), job.parent / "montage.mp4", job.parent / "segments.txt"]:
@@ -1652,7 +1669,8 @@ def check_montage_pause(stop):
 
 def write_montage(sources, candidates, output, progress=print, *, audio_offset_ms=0,
                   acceleration=VideoAcceleration(), checkpoint=None, stop=None,
-                  output_format="mkv", mic_mix_track=None):
+                  output_format="mkv", mic_mix_track=None, style=None):
+    style = style or MontageStyle()
     if output_format not in ("mkv", "mp4"):
         raise ValueError("Choose MKV or MP4 for the montage.")
     if mic_mix_track is not None and mic_mix_track < 1:
@@ -1695,11 +1713,14 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
                     result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
                     continue
                 result.exports.append(path)
-                segments.append(MontageSegment(path, layout, duration, result))
+                segments.append(MontageSegment(path, layout, duration, result, clip))
         check_montage_pause(stop)
         if not segments:
             return results, None
         segments.sort(key=lambda segment: source_order[segment.result.source])
+        if style.active:
+            return results, styled_montage(segments, staging, output, output_format, mic_mix_track, style,
+                                           progress, acceleration, stop)
         expected = max((segment.layout for segment in segments), key=len)
         mixed = any(not compatible_montage_layout(segment.layout, expected) for segment in segments)
         audio = expected[1:]
@@ -1785,13 +1806,282 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
         return results, destination
 
 
+TRANSITIONS = ("None", "Flip", "Whip pan", "Zoom punch", "Flash", "Pixelate", "Slide", "Random")
+VERTICAL_MODES = ("Off", "9:16 blurred fill", "9:16 centre crop")
+VERTICAL_SIZE = (1080, 1920)
+# Kills this close together count as one multi-kill for slow motion.
+MULTI_KILL_GAP = 3.0
+KILL_CUES = ("Kill feed", "KILL badge")
+MIC_BEFORE_KILL, MIC_AFTER_KILL = 1.0, 2.5
+
+
+@dataclass(frozen=True)
+class MontageStyle:
+    transition: str = "None"
+    transition_seconds: float = .4
+    vertical: str = "Off"
+    slowmo_multikills: bool = False
+    slowmo_speed: float = .5
+    mic_at_kills: bool = False
+
+    def __post_init__(self):
+        if self.transition not in TRANSITIONS:
+            raise ValueError(f"Choose a transition: {', '.join(TRANSITIONS)}.")
+        if self.vertical not in VERTICAL_MODES:
+            raise ValueError(f"Choose a vertical mode: {', '.join(VERTICAL_MODES)}.")
+        if not .1 <= self.transition_seconds <= 2:
+            raise ValueError("Transition length must be between 0.1 and 2 seconds.")
+        if not .25 <= self.slowmo_speed < 1:
+            raise ValueError("Slow motion speed must be between 0.25 and 1.")
+
+    @property
+    def active(self):
+        return (self.transition != "None" or self.vertical != "Off"
+                or self.slowmo_multikills or self.mic_at_kills)
+
+
+def clip_kills(clip):
+    """Kill times relative to the clip start, each with how many kills the feed showed at once."""
+    counts = {}
+    for time, reason in clip.cues:
+        if reason in KILL_CUES:
+            counts.setdefault(time, 1)
+        elif reason.startswith(KILL_COUNT_PREFIX):
+            counts[time] = max(counts.get(time, 1), int(reason.removeprefix(KILL_COUNT_PREFIX)))
+    return sorted((time - clip.start, count) for time, count in counts.items())
+
+
+def multi_kill_windows(kills, duration):
+    windows = []
+    group = []
+    for time, count in kills + [(math.inf, 0)]:
+        if group and time - group[-1][0] > MULTI_KILL_GAP:
+            if sum(count for _, count in group) >= 2:
+                windows.append((max(0, group[0][0] - .4), min(duration, group[-1][0] + 1.2)))
+            group = []
+        group.append((time, count))
+    return [window for window in windows if window[1] - window[0] > .2]
+
+
+def speed_parts(duration, windows, speed):
+    """Split 0..duration into (start, end, speed) parts."""
+    parts = []
+    position = 0
+    for start, end in windows:
+        if start > position:
+            parts.append((position, start, 1))
+        parts.append((start, end, speed))
+        position = end
+    if position < duration:
+        parts.append((position, duration, 1))
+    return parts
+
+
+def mic_envelope(kills, ramp=.15):
+    terms = [f"max(0,min(1,min((t-{time - MIC_BEFORE_KILL:.3f})/{ramp},({time + MIC_AFTER_KILL:.3f}-t)/{ramp})))"
+             for time, _ in kills]
+    if not terms:
+        return "0"
+    expression = terms[0]
+    for term in terms[1:]:
+        expression = f"max({expression},{term})"
+    return expression
+
+
+def flip_expression():
+    """A card flip: the first clip folds to a vertical line, then the next unfolds from it."""
+    def sample(clip, scale):
+        x = f"(W/2+(X-W/2)/max({scale},0.001))"
+        pixel = f"if(eq(PLANE,0),{clip}0({x},Y),if(eq(PLANE,1),{clip}1({x},Y),{clip}2({x},Y)))"
+        return f"if(lt(abs(X-W/2),{scale}*W/2),{pixel},if(eq(PLANE,0),16,128))"
+    return f"if(gt(P,0.5),{sample('a', '(2*P-1)')},{sample('b', '(1-2*P)')})"
+
+
+def transition_filter(name, seconds):
+    """Return the xfade options and any filter to apply to the finished transition."""
+    xfade = {"Flip": "custom:expr='" + flip_expression() + "'", "Whip pan": "slideleft",
+             "Zoom punch": "zoomin", "Flash": "fadewhite", "Pixelate": "pixelize", "Slide": "smoothup"}[name]
+    after = ",tmix=frames=5" if name == "Whip pan" else ""
+    return f"xfade=transition={xfade}:duration={seconds:.3f}:offset=0{after}"
+
+
+@dataclass
+class StyledSegment:
+    path: Path
+    duration: float
+    parts: list
+    main: int | None
+    mic: int | None
+    kills: list
+    rate: str
+    hdr: bool
+    source_duration: float
+
+
+def styled_streams(segment, index, style, size, can_tonemap):
+    """Filters that turn input `index` into a styled [v{index}] and stereo [a{index}]."""
+    width, height = size
+    video = f"[{index}:v:0]setpts=PTS-STARTPTS,fps={segment.rate}"
+    if segment.hdr and can_tonemap:
+        # Bring HLG/PQ captures to SDR so phones and social sites show the right colours.
+        tonemap = ("zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,"
+                   "zscale=t=bt709:m=bt709:r=tv")
+    else:
+        tonemap = None
+    if style.vertical == "9:16 blurred fill":
+        geometry = (f"split=2[bg{index}][fg{index}];"
+                    f"[bg{index}]scale={width // 4}:{height // 4}:force_original_aspect_ratio=increase,"
+                    f"crop={width // 4}:{height // 4},boxblur=12:2,scale={width}:{height}[bgs{index}];"
+                    f"[fg{index}]scale={width}:-2[fgs{index}];[bgs{index}][fgs{index}]overlay=(W-w)/2:(H-h)/2")
+    elif style.vertical == "9:16 centre crop":
+        geometry = f"scale=-2:{height},crop={width}:{height}"
+    else:
+        geometry = (f"scale=w='max(2,trunc(min({width},{height}*dar)/2)*2)':"
+                    f"h='max(2,trunc(min({height},{width}/dar)/2)*2)',pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
+    # Frame first, then tone map and convert the (smaller) final picture.
+    finish = (("," + tonemap) if tonemap else "") + ",format=yuv420p"
+    graph = []
+    head = video
+    audio = (f"[{index}:a:{segment.main}]" if segment.main is not None
+             else f"anullsrc=r=48000:cl=stereo,atrim=duration={segment.source_duration:.3f}[silence{index}];[silence{index}]")
+    audio += "aresample=48000:async=1:first_pts=0,aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo"
+    if segment.mic is not None:
+        envelope = mic_envelope(segment.kills) if style.mic_at_kills else "1"
+        graph.append(f"[{index}:a:{segment.mic}]aresample=48000:async=1:first_pts=0,"
+                     f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                     f"volume='{envelope}':eval=frame[mic{index}]")
+        audio += f"[game{index}];[game{index}][mic{index}]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95"
+    if len(segment.parts) > 1:
+        graph.append(head + f",split={len(segment.parts)}" + "".join(f"[vp{index}_{n}]" for n in range(len(segment.parts))))
+        graph.append(audio + f",asplit={len(segment.parts)}" + "".join(f"[ap{index}_{n}]" for n in range(len(segment.parts))))
+        pieces = []
+        for n, (start, end, speed) in enumerate(segment.parts):
+            graph.append(f"[vp{index}_{n}]trim=start={start:.3f}:end={end:.3f},setpts=(PTS-STARTPTS)/{speed}[vq{index}_{n}]")
+            tempo = "" if speed == 1 else (f",atempo={speed}" if speed >= .5 else f",atempo=0.5,atempo={speed / .5:.4f}")
+            graph.append(f"[ap{index}_{n}]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS"
+                         + tempo + f"[aq{index}_{n}]")
+            pieces.append(f"[vq{index}_{n}][aq{index}_{n}]")
+        graph.append("".join(pieces) + f"concat=n={len(segment.parts)}:v=1:a=1[vs{index}][a{index}]")
+        graph.append(f"[vs{index}]fps={segment.rate}," + geometry + finish + f",setsar=1[v{index}]")
+    else:
+        graph.append(head + "," + geometry + finish + f",setsar=1[v{index}]")
+        graph.append(audio + f"[a{index}]")
+    return graph
+
+
+def styled_montage(segments, staging, output, output_format, mic_mix_track, style, progress, acceleration, stop):
+    """Build a montage with transitions, slow motion, vertical framing and a mic mix.
+
+    Each clip body and each transition is encoded on its own, then the pieces are joined
+    without re-encoding, so the work grows only with the number of clips.
+    """
+    if style.mic_at_kills and mic_mix_track is None:
+        raise ValueError("Choose the mic track to mix in at kill time.")
+    can_tonemap = "zscale" in ffmpeg_features("ffmpeg", "-filters")
+    styled = []
+    for segment in segments:
+        streams, duration = montage_segment_info(segment.path)
+        video = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries",
+                                "stream=width,height,avg_frame_rate,r_frame_rate,color_transfer",
+                                "-of", "json", str(segment.path)]))["streams"][0]
+        audio = [stream for stream in streams if stream["codec_type"] == "audio"]
+        titles = [stream.get("tags", {}).get("title", "").casefold().strip() for stream in audio]
+        mic = mic_mix_track - 1 if mic_mix_track is not None and mic_mix_track <= len(audio) else None
+        others = [index for index in range(len(audio)) if index != mic]
+        main = next((index for index in others if titles[index] in ("game", "game audio")),
+                    others[0] if others else None)
+        kills = clip_kills(segment.clip)
+        windows = multi_kill_windows(kills, duration) if style.slowmo_multikills else []
+        parts = speed_parts(duration, windows, style.slowmo_speed)
+        rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "60"
+        if rate in ("0/0", "0"):
+            rate = "60"
+        styled.append(StyledSegment(segment.path, sum((end - start) / speed for start, end, speed in parts), parts,
+                                    main, mic, kills, rate,
+                                    video.get("color_transfer") in ("arib-std-b67", "smpte2084"), duration))
+        if len(styled) == 1:
+            first = video
+    size = VERTICAL_SIZE if style.vertical != "Off" else (max(2, first["width"] // 2 * 2), max(2, first["height"] // 2 * 2))
+    rate = styled[0].rate
+    for item in styled:
+        item.rate = rate
+    gap = style.transition_seconds if style.transition != "None" else 0
+    if gap:
+        gap = min(gap, min(item.duration for item in styled) / 3)
+    # Random goes through every transition in a shuffled order before repeating one.
+    names = [name for name in TRANSITIONS if name not in ("None", "Random")]
+    Random(":".join(item.path.name for item in styled)).shuffle(names)
+    sdr = can_tonemap or not any(item.hdr for item in styled)
+    key = hashlib.sha256(json.dumps([asdict(style), mic_mix_track, size, gap, can_tonemap,
+                                     [item.path.name for item in styled]]).encode()).hexdigest()[:12]
+    pieces = []
+    total = sum(item.duration for item in styled) - gap * (len(styled) - 1)
+
+    def encode_piece(name, inputs, graph, label, duration):
+        destination = staging / f"styled-{key}-{name}.mkv"
+        pieces.append(destination)
+        if destination.is_file():
+            progress(f"{label} · Reusing encoded piece.")
+            return
+        check_montage_pause(stop)
+        working = staging / f"working-{destination.name}"
+        working.unlink(missing_ok=True)
+        command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-filter_threads", "2"]
+        streams = []
+        for path in inputs:
+            streams += ["-i", str(path)]
+        streams += ["-filter_complex", ";".join(graph), "-map", "[vout]", "-map", "[aout]", "-c:a", "flac"]
+        if sdr:
+            streams += ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
+        encode_video(command, streams, working, lambda message: progress(f"{label} · {message}"),
+                     acceleration, duration)
+        working.replace(destination)
+
+    for index, item in enumerate(styled):
+        head = gap if index > 0 else 0
+        tail = gap if index < len(styled) - 1 else 0
+        graph = styled_streams(item, 0, style, size, can_tonemap)
+        graph.append(f"[v0]trim=start={head:.3f}:end={item.duration - tail:.3f},setpts=PTS-STARTPTS[vout]")
+        graph.append(f"[a0]atrim=start={head:.3f}:end={item.duration - tail:.3f},asetpts=PTS-STARTPTS[aout]")
+        encode_piece(f"{index:04d}-body", [item.path], graph, f"Styling clip {index + 1}/{len(styled)}",
+                     item.duration - head - tail)
+        if tail:
+            following = styled[index + 1]
+            name = style.transition if style.transition != "Random" else names[index % len(names)]
+            graph = styled_streams(item, 0, style, size, can_tonemap) + styled_streams(following, 1, style, size, can_tonemap)
+            graph.append(f"[v0]trim=start={item.duration - gap:.3f},setpts=PTS-STARTPTS[va]")
+            graph.append(f"[v1]trim=end={gap:.3f},setpts=PTS-STARTPTS[vb]")
+            graph.append(f"[va][vb]{transition_filter(name, gap)},format=yuv420p[vout]")
+            graph.append(f"[a0]atrim=start={item.duration - gap:.3f},asetpts=PTS-STARTPTS[aa]")
+            graph.append(f"[a1]atrim=end={gap:.3f},asetpts=PTS-STARTPTS[ab]")
+            graph.append(f"[aa][ab]acrossfade=d={gap:.3f}:c1=tri:c2=tri[aout]")
+            encode_piece(f"{index:04d}-transition", [item.path, following.path], graph,
+                         f"{name} transition {index + 1}/{len(styled) - 1}", gap)
+    check_montage_pause(stop)
+    progress(f"Joining montage · 0% · {len(styled)} highlight segment(s)")
+    manifest = staging / f"styled-{key}.txt"
+    manifest.write_text("".join(f"file '{path.name}'\n" for path in pieces), encoding="utf-8")
+    encoded = staging / f"montage.{output_format}"
+    command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+               "-f", "concat", "-safe", "0", "-i", str(manifest), "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy"]
+    command += ["-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart"] if output_format == "mp4" else ["-c:a", "copy"]
+    title = "Game + mic" if mic_mix_track is not None else "Game"
+    for key_name in (("title", "handler_name") if output_format == "mp4" else ("title",)):
+        command += ["-metadata:s:a:0", f"{key_name}={title}"]
+    run_export(command + [str(encoded)], "Joining montage", progress, total)
+    destination = publish_export(encoded, output, "kill-montage-vertical" if style.vertical != "Off" else "kill-montage")
+    progress(f"Joining montage · 100% · {output_format.upper()} saved")
+    return destination
+
+
 def kill_montage(sources, player, before, after, output, progress=print, *,
                  audio_offset_ms=0, workers=DEFAULT_MONTAGE_WORKERS, feed=KillFeedOptions(),
-                 acceleration=VideoAcceleration(), output_format="mkv", mic_mix_track=None):
+                 acceleration=VideoAcceleration(), output_format="mkv", mic_mix_track=None, style=None):
     with closing(scan_kills(sources, player, before, after, progress, workers=workers,
                             feed=feed, acceleration=acceleration)) as candidates:
         return write_montage(sources, candidates, output, progress, audio_offset_ms=audio_offset_ms,
-                             acceleration=acceleration, output_format=output_format, mic_mix_track=mic_mix_track)
+                             acceleration=acceleration, output_format=output_format, mic_mix_track=mic_mix_track,
+                             style=style)
 
 
 def parse_mic_track(value):
@@ -1825,6 +2115,14 @@ def main():
                         help="Container for the joined montage (default: mkv).")
     parser.add_argument("--mix-mic-track", type=int, metavar="N",
                         help="Add 1-based audio track N to the default montage playback mix.")
+    parser.add_argument("--transition", choices=[name.lower().replace(" ", "-") for name in TRANSITIONS],
+                        default="none", help="Montage transition between clips.")
+    parser.add_argument("--vertical", choices=("off", "blur", "crop"), default="off",
+                        help="Make a 9:16 montage for TikTok/Shorts: blurred fill or centre crop.")
+    parser.add_argument("--slowmo-multikills", action="store_true",
+                        help="Play multi-kills at half speed in the montage.")
+    parser.add_argument("--mic-at-kills", action="store_true",
+                        help="With --mix-mic-track, mix the mic in only around each kill.")
     parser.add_argument("--kill-badge", action="store_true",
                         help="Detect Battlefield's on-screen KILL label in montage mode. Omit --player for badge only.")
     parser.add_argument("--badge-feed-details", action="store_true",
@@ -1859,6 +2157,14 @@ def main():
         parser.error("--montage-format and --mix-mic-track require --kill-montage.")
     if args.mix_mic_track is not None and args.mix_mic_track < 1:
         parser.error("--mix-mic-track requires a positive track number.")
+    style = MontageStyle(
+        transition=next(name for name in TRANSITIONS if name.lower().replace(" ", "-") == args.transition),
+        vertical={"off": "Off", "blur": VERTICAL_MODES[1], "crop": VERTICAL_MODES[2]}[args.vertical],
+        slowmo_multikills=args.slowmo_multikills, mic_at_kills=args.mic_at_kills)
+    if style.active and not args.kill_montage:
+        parser.error("--transition, --vertical, --slowmo-multikills and --mic-at-kills require --kill-montage.")
+    if args.mic_at_kills and args.mix_mic_track is None:
+        parser.error("--mic-at-kills requires --mix-mic-track.")
     if args.recording is None:
         from desktop import launch
         launch()
@@ -1888,7 +2194,7 @@ def main():
                                             audio_offset_ms=args.audio_offset_ms, workers=args.workers,
                                             feed=feed, acceleration=acceleration,
                                             output_format=args.montage_format or "mkv",
-                                            mic_mix_track=args.mix_mic_track)
+                                            mic_mix_track=args.mix_mic_track, style=style)
             for result in results:
                 if args.show_feed and result.badge_samples is not None:
                     print(f"{result.source.name}: KILL badge seen in {result.badge_samples} sample(s).")

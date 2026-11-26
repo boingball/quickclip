@@ -83,7 +83,9 @@ class SavedScan:
                     continue
                 row = stored["result"]
                 row["source"] = source
-                row["clips"] = [Clip(item["start"], item["end"], tuple(item["reasons"])) for item in row["clips"]]
+                row["clips"] = [Clip(item["start"], item["end"], tuple(item["reasons"]),
+                                     tuple((float(time), str(reason)) for time, reason in item.get("cues", ())))
+                                for item in row["clips"]]
                 row["exports"] = []
                 for key in ("feed_rows", "feed_lookalikes"):
                     row[key] = Counter(row[key])
