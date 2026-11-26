@@ -147,6 +147,22 @@ def resolve_video_acceleration(requested, progress=print):
     return VideoAcceleration(encode, decode)
 
 
+def last_packet_time(path):
+    try:
+        listing = run(["ffprobe", "-v", "quiet", "-select_streams", "V:0", "-show_entries",
+                       "packet=pts_time,duration_time", "-of", "csv=p=0", str(path)])
+    except (OSError, RuntimeError):
+        return 0
+    end = 0
+    for line in listing.decode(errors="replace").splitlines():
+        parts = line.strip().rstrip(",").split(",")
+        try:
+            end = max(end, float(parts[0]) + (float(parts[1]) if len(parts) > 1 and parts[1] else 0))
+        except ValueError:
+            continue
+    return end
+
+
 def probe(path):
     info = json.loads(run(["ffprobe", "-v", "error", "-show_format",
                            "-show_streams", "-of", "json", str(path)]))
@@ -156,7 +172,14 @@ def probe(path):
         raise ValueError("Select a recording with a video stream.")
     audio = tuple(s.get("tags", {}).get("title", s["codec_name"])
                   for s in info["streams"] if s["codec_type"] == "audio")
-    duration = float(info["format"].get("duration", 0))
+    try:
+        duration = float(info["format"].get("duration", 0))
+    except ValueError:
+        duration = 0
+    if not math.isfinite(duration) or duration <= 0:
+        # Recordings cut off mid-write (a crash, a full disk, an interrupted replay save)
+        # have no duration or seek index. Use the last video packet instead.
+        duration = last_packet_time(path)
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("The recording needs a readable duration.")
     frame_size = (video["width"], video["height"])
@@ -272,12 +295,15 @@ NAME_TOKEN = re.compile(r"(?=[\w.-]*[^\W\d_])[\w.-]{3,32}")
 OCR_LOOKALIKES = ("o0", "il1", "s5", "b8", "z2")
 GREEN_PLAYER = "Green player"
 FAINT_TEXT = "Faint text"
-OCR_MODES = ("Grayscale", "Bright text", "Colored HUD", GREEN_PLAYER, FAINT_TEXT)
+LOCAL_CONTRAST = "Local contrast"
+OCR_MODES = ("Grayscale", "Bright text", "Colored HUD", GREEN_PLAYER, FAINT_TEXT, LOCAL_CONTRAST)
 KILL_BADGE_MODE = OCR_MODES[0]
 KILL_BADGE_PAGE_MODE = "11"
 KILL_BADGE_TEXT_LUT = bytes(0 if value >= 175 else 255 for value in range(256))
 OCR_PATCH_SIZE = 12
-OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored", "green", "faint"), OCR_MODES))
+OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored", "green", "faint", "local"), OCR_MODES))
+# Half-second samples a player's kill-feed line count is remembered, to ride out OCR dropouts.
+FEED_KILL_MEMORY = 6
 OCR_WIDTH, OCR_HEIGHT = 960, 480
 OCR_HEADER = f"P5\n{OCR_WIDTH} {OCR_HEIGHT}\n255\n".encode("ascii")
 OCR_CONFIDENCE = 60
@@ -310,6 +336,7 @@ class OCRWord:
 class OCRRow:
     words: tuple[OCRWord, ...]
     divider: float | None = None
+    edge: float | None = None
 
     @property
     def text(self):
@@ -323,9 +350,19 @@ class OCRRow:
     def side(self, word):
         if self.divider is not None:
             return "left" if word.centre < self.divider else "right"
+        if self.edge is not None:
+            # Kill-feed lines end at the same right edge. A killer's name is followed by
+            # the weapon icon and the victim, so it ends well short of that edge even when
+            # the victim's name is too faint to read.
+            return "left" if word.right < self.edge - 2.5 * word.height else "right"
         return "unknown"
 
     def name_sides(self, pattern):
+        for spelling, side, green, _ in self.name_words(pattern):
+            yield spelling, side, green
+
+    def name_words(self, pattern):
+        """Yield each match's spelling, side, whether it is green, and its last OCR word."""
         spans = []
         start = 0
         for word in self.words:
@@ -337,7 +374,7 @@ class OCRRow:
             if hits:
                 sides = {self.side(word) for word in hits}
                 side = sides.pop() if len(sides) == 1 else "unknown"
-                yield match.group(), side, all(word.green for word in hits)
+                yield match.group(), side, all(word.green for word in hits), hits[-1]
 
 
 @dataclass(frozen=True)
@@ -439,10 +476,11 @@ def position_feed_rows(rows, fixed_divider):
         else:
             groups.append([word])
 
+    edge = max((word.right for group in groups for word in group), default=None)
     positioned = []
     for group in sorted(groups, key=lambda group: group[0].middle):
         words = tuple(sorted(group, key=lambda word: word.left))
-        positioned.append(OCRRow(words, find_row_gap(words)))
+        positioned.append(OCRRow(words, find_row_gap(words), edge))
     return tuple(positioned)
 
 
@@ -460,7 +498,11 @@ def player_name_pattern(player, allow_lookalikes=False):
 
 def ocr_filter(region, mode):
     width, height, left, top = region
-    filters = (f"crop=iw*{width}:ih*{height}:iw*{left}:ih*{top}:exact=1,"
+    # Convert to 8 bits before cropping. With 10-bit video (such as HDR game captures),
+    # FFmpeg 8 garbles letter edges when an exact crop at an odd offset is converted
+    # later, which defeats OCR.
+    convert = "format=gray" if mode in (OCR_MODES[0], OCR_MODES[1], LOCAL_CONTRAST) else "format=yuv444p"
+    filters = (f"{convert},crop=iw*{width}:ih*{height}:iw*{left}:ih*{top}:exact=1,"
                f"scale={OCR_WIDTH}:{OCR_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos")
     pad = f"pad={OCR_WIDTH}:{OCR_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
     if mode == FAINT_TEXT:
@@ -470,6 +512,16 @@ def ocr_filter(region, mode):
                 "[detail][background]blend=all_mode=difference,"
                 "geq=lum='clip(255-22*max(max(max(lum(X,Y),cb(X,Y)),cr(X,Y))-1,0),0,255)':"
                 "cb=128:cr=128:interpolation=nearest,format=gray," + pad + ":color=white,setsar=1")
+    if mode == LOCAL_CONTRAST:
+        # Stretch each pixel between the darkest and brightest values within ~10 px.
+        # Translucent HUD text over bright sky differs from it by only ~15 levels, and
+        # mostly in its outline, so a global threshold loses it.
+        erode, dilate = ",".join(["erosion"] * 10), ",".join(["dilation"] * 10)
+        return (filters + f",format=gray,split=3[y][low][high];[low]{erode},gblur=sigma=3,split=2[min1][min2];"
+                f"[high]{dilate},gblur=sigma=3[max];[y][min1]blend=all_expr='A-B'[detail];"
+                "[max][min2]blend=all_expr='A-B'[range];"
+                "[detail][range]blend=all_expr='clip(255*A/max(B,24),0,255)',"
+                + pad + ":color=white,setsar=1")
     filters += "," + pad
     if mode in (OCR_MODES[2], GREEN_PLAYER):
         # Isolate saturated HUD lettering from relatively neutral scenery.
@@ -735,7 +787,7 @@ def badge_feed_details(path, recording, timestamp, badge_rows, player, feed, sto
         return ()
 
     green_only = feed.mode == GREEN_PLAYER
-    player_pattern = player_name_pattern(player, allow_lookalikes=green_only) if player else None
+    player_pattern = player_name_pattern(player, allow_lookalikes=True) if player else None
     divider = (feed_divider_x(recording.frame_size, feed.region, feed.divider)
                if feed.divider is not None else None)
 
@@ -887,6 +939,35 @@ def kill_badge_match(frame, rows, reference=None):
     return None
 
 
+KILL_ID_SEPARATOR = "\x00"
+
+
+class KillTracker:
+    """Turn per-sample kill-feed matches into one event per kill.
+
+    Each kill adds one line with the player's name to the feed, and the line stays up for
+    several seconds while OCR reads it a little differently from frame to frame. Count the
+    player's lines and report only a rise above the most seen in the last few seconds, so a
+    line that flickers out of OCR for a moment is not reported again.
+    """
+
+    def __init__(self, memory=FEED_KILL_MEMORY):
+        self.counts = deque(maxlen=memory)
+        self.sample = -1
+
+    def update(self, lines):
+        """Take (row text, vertical position) pairs; return IDs of the rows that are new kills."""
+        self.sample += 1
+        recent = max(self.counts, default=0)
+        self.counts.append(len(lines))
+        added = len(lines) - recent
+        if added <= 0:
+            return set()
+        # Name the lowest lines: the feed adds new lines at the bottom.
+        newest = sorted(lines, key=lambda line: line[1])[-added:]
+        return {f"{text}{KILL_ID_SEPARATOR}{self.sample}.{index}" for index, (text, _) in enumerate(newest)}
+
+
 def ocr_events(path, region, reason, identify, duration, progress, *,
                page_mode="11", stop=None, mode=OCR_MODES[0], for_ocr=None, rounding="near",
                hardware_decode=False, describe=None):
@@ -981,9 +1062,11 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         killer_only = feed is not None and not feed.any_mention
         green_only = feed is not None and feed.mode == GREEN_PLAYER
         player_pattern = player_name_pattern(player)
-        feed_pattern = player_name_pattern(player, allow_lookalikes=True) if green_only else player_pattern
+        # OCR often reads O as 0 or l as 1; the side check below guards against deaths.
+        feed_pattern = player_name_pattern(player, allow_lookalikes=True) if feed else player_pattern
         divider = (feed_divider_x(recording.frame_size, feed.region, feed.divider)
                    if feed and feed.divider is not None else None)
+        kills = KillTracker()
 
         def feed_matches(rows, _frame):
             if feed:
@@ -995,18 +1078,18 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
             matches = set()
             lookalikes = set()
             lookalike_rows = set()
+            killer_rows = []
             if feed:
                 for row in rows:
-                    for spelling, side, green in row.name_sides(feed_pattern):
+                    for spelling, side, green, word in row.name_words(feed_pattern):
                         if not player_pattern.fullmatch(spelling):
-                            if not green:
-                                continue
                             lookalikes.add(spelling.casefold())
                             lookalike_rows.add(row.text.casefold())
                         sides.add(side)
                         green_name |= green
                         if (side == "left" or not killer_only) and (green or not green_only):
                             matches.add(row.text.casefold())
+                            killer_rows.append((row.text.casefold(), word.middle))
             else:
                 matches = mentions
             if diagnostics is not None:
@@ -1025,11 +1108,14 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                     line = line[:160]
                     if len(diagnostics.feed_rows) < 100 or line in diagnostics.feed_rows:
                         diagnostics.feed_rows[line] += 1
-            return matches
+            if not feed:
+                return matches
+            return kills.update(killer_rows)
 
         def describe_weapons(rows, frame, new_matches, _timestamp):
+            new_lines = {match.split(KILL_ID_SEPARATOR)[0] for match in new_matches}
             for row in position_feed_rows(rows, divider):
-                if row.text.casefold() not in new_matches:
+                if row.text.casefold() not in new_lines:
                     continue
                 if any(side == "left" and (marked_green or not green_only)
                        for _, side, marked_green in row.name_sides(feed_pattern)):

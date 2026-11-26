@@ -29,6 +29,8 @@ Auto looks for a track named **Mic** or **Microphone** first. With generic names
 2. Click **Output folder** to choose where clips go, or use the default `Highlights` subfolder. The app creates it when exporting.
 3. Click **Scan and export all** to process the batch automatically, or **Find highlights** to review candidates first. The app shows the current file and keeps going if a recording fails. The results list identifies each candidate's source, and any errors appear at the end.
 
+A recording that was cut off while being written, for example an interrupted replay save, has no duration or seek index. QuickClip reads its length from the last video frame instead, which takes a few seconds.
+
 For a large first batch, try mic-only detection and **Find highlights** on a few recordings to check your track and threshold before enabling OCR or exporting everything. Running an export again can create additional copies with numbered filenames.
 
 ## Make a kill montage
@@ -64,11 +66,17 @@ On Windows, tick **Shut down PC after montage** for an unattended build. QuickCl
 
 Open **OCR readout** to see possible names and readable rows from each recording. If those rows look wrong, open **Set kill-feed area**, load a frame at a known kill, and draw a tight box around the complete feed. Choose **Colored HUD** for red, blue, or green lettering, **Bright text** for light lettering, or **Grayscale** for an unfiltered comparison. Click **Test feed OCR** to see the processed crop and Tesseract's readings for that frame before saving or scanning the folder. The numbers next to the words are Tesseract confidence scores. **Match name anywhere in feed** is a looser check that can also include deaths and assists.
 
-In **Set kill-feed area**, include the entire feed with space for long names on both sides. **Test feed OCR** shows the detected gaps and labels each word left, right, or unknown. **OCR readout** counts all three. A lone readable name has an unknown side in automatic mode. Use **Match name anywhere in feed** to include those moments for manual review. For a feed with a fixed split, enable **Use fixed divider** to use a single vertical line.
+In **Set kill-feed area**, include the entire feed with space for long names on both sides. **Test feed OCR** shows the detected gaps and labels each word left, right, or unknown. **OCR readout** counts all three. When the other name in a row is too faint to read, QuickClip uses the feed's right edge instead: a killer's name is followed by the weapon icon and the victim, so it ends well short of the edge, while a victim's name reaches it. For a feed with a fixed split, enable **Use fixed divider** to use a single vertical line.
 
 The **Recording** list in **Set kill-feed area** lets you pick any file in the open folder. Use **Play recording** to open it in FFplay from the entered time. In FFplay, use the arrow keys to seek and **Space** to pause when the kill is visible. Return to QuickClip and click **Use playback time**, then **Test feed OCR**. You can adjust the frame time by hand if you want a nearby frame.
 
-If your name is always green, try **Green player**. QuickClip requires the matching name to be green and keeps the other colored names visible for the killer-side check. For names of at least six letters or digits, it also accepts one common OCR substitution, such as `l` for `i` or `o` for `0`. **OCR readout** lists those spellings separately for review. **Test feed OCR** marks the words it classified as green. The command-line equivalent is `--feed-text-mode green`.
+Each kill is reported once, when another line with your name appears on the killer side. Lines that stay up for several seconds, or briefly drop out of OCR, do not start new clips. Multi-kills shown together become one clip.
+
+For Battlefield 6, choose **Local contrast**. The game draws your own name in near-white with a ▸ marker, not in your squad's green, and the feed is translucent: over bright sky your name is only about 15 brightness levels from the background, and mostly visible by its outline. **Local contrast** stretches each pixel between the darkest and brightest values around it, which keeps those names readable without depending on color. The command-line equivalent is `--feed-text-mode local`. Your player name is matched without regard to case, and with one common OCR substitution such as `0` for `O`. On sample BF6 replays it found 11 of 11 kills with no false clips, against 9 of 11 for **Grayscale** and none for **Green player**.
+
+HDR recordings (for example BF6's 10-bit HLG replays) are converted to 8 bits before OCR, without tone mapping. Tone mapping made no difference to OCR in testing.
+
+If your name is always green, try **Green player**. QuickClip requires the matching name to be green and keeps the other colored names visible for the killer-side check. For names of at least six letters or digits, every mode also accepts one common OCR substitution, such as `l` for `i` or `o` for `0`. **OCR readout** lists those spellings separately for review. **Test feed OCR** marks the words it classified as green. The command-line equivalent is `--feed-text-mode green`.
 
 For washed-out lettering, try **Faint text** in **Test feed OCR** first. It boosts small differences in brightness and color around the letters. It works on light and dark names in the same row without requiring a green hue. Save the area to apply the treatment to your montage scan. The command-line equivalent is `--feed-text-mode faint`.
 
@@ -115,7 +123,7 @@ The command uses three seconds before and two after each match by default. Overr
 Add `--files 5` to try the first five recordings in filename order. This limits the number of source files scanned. Each recording can still yield multiple highlights.
 Use `--workers 2` to scan two recordings at a time, or `--workers 1` to scan sequentially.
 
-Use `--show-feed` to show OCR rows and `--feed-region 58,0,42,30` to set the crop as left, top, width, and height percentages. Use `--feed-divider 50` to override per-row detection with a fixed split halfway across the crop. Use `--feed-text-mode colored` to isolate saturated lettering, `--any-feed-mention` for looser matching, and `--montage-audio-fallback` to check loud audio when a recording has no kill matches.
+Use `--show-feed` to show OCR rows and `--feed-region 58,0,42,30` to set the crop as left, top, width, and height percentages. Use `--feed-divider 50` to override per-row detection with a fixed split halfway across the crop. Use `--feed-text-mode colored` to isolate saturated lettering, `--feed-text-mode local` for translucent feeds such as Battlefield 6, `--any-feed-mention` for looser matching, and `--montage-audio-fallback` to check loud audio when a recording has no kill matches.
 
 For a badge-only montage, pass `--kill-montage --kill-badge --output "F:\QuickClip-Montage"`. Add `--player boingball` to scan both cues.
 
