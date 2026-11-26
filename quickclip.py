@@ -498,10 +498,11 @@ def player_name_pattern(player, allow_lookalikes=False):
 
 def ocr_filter(region, mode):
     width, height, left, top = region
-    # Convert to 8 bits before scaling. Scaling full-range 10-bit video (such as HDR game
-    # captures) straight to gray garbles letter edges in FFmpeg 8, which defeats OCR.
+    # Convert to 8 bits before cropping. With 10-bit video (such as HDR game captures),
+    # FFmpeg 8 garbles letter edges when an exact crop at an odd offset is converted
+    # later, which defeats OCR.
     convert = "format=gray" if mode in (OCR_MODES[0], OCR_MODES[1], LOCAL_CONTRAST) else "format=yuv444p"
-    filters = (f"crop=iw*{width}:ih*{height}:iw*{left}:ih*{top}:exact=1,{convert},"
+    filters = (f"{convert},crop=iw*{width}:ih*{height}:iw*{left}:ih*{top}:exact=1,"
                f"scale={OCR_WIDTH}:{OCR_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos")
     pad = f"pad={OCR_WIDTH}:{OCR_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
     if mode == FAINT_TEXT:
