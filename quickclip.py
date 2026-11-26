@@ -8,6 +8,7 @@ import csv
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
 from difflib import SequenceMatcher
+from fractions import Fraction
 from functools import lru_cache
 import hashlib
 from itertools import islice
@@ -75,6 +76,9 @@ DEFAULT_MONTAGE_WORKERS = min(4, os.cpu_count() or 1)
 BACKGROUND = {"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}
 RADEON_DECODE_ARGS = ["-xerror", "-init_hw_device", "d3d11va=radeon:,vendor_id=0x1002",
                       "-hwaccel", "d3d11va", "-hwaccel_device", "radeon"]
+MONTAGE_CACHE_VERSION = 2
+FLAC_ARGS = ["-c:a", "flac", "-frame_size:a", "4096"]
+
 MONTAGE_CHECKPOINTS = ".quickclip-montage-resume"
 
 
@@ -123,7 +127,9 @@ def run(command, input=None, **kwargs):
 
 def run_export(command, description, progress, duration=None):
     """Report ffmpeg video output as it is written and retain stderr for failures."""
-    command = command[:1] + ["-nostats", "-stats_period", "1", "-progress", "pipe:1"] + command[1:]
+    command = command[:1] + ["-xerror", "-abort_on", "empty_output_stream", "-nostats", "-stats_period", "1", "-progress", "pipe:1"] + command[1:]
+    invocation = json.dumps(command, ensure_ascii=False)
+    progress(f"{description} · FFmpeg argv: {invocation}")
     with tempfile.TemporaryFile() as errors:
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, encoding="utf-8",
                               errors="replace", **BACKGROUND) as process, tracked(process):
@@ -155,8 +161,9 @@ def run_export(command, description, progress, duration=None):
                     stats.clear()
                 if process.wait():
                     errors.seek(0)
-                    raise RuntimeError(errors.read().decode(errors="replace").strip()
-                                       or "FFmpeg export failed.")
+                    diagnostic = errors.read().decode(errors="replace").strip()
+                    progress(f"{description} · FFmpeg exit {process.returncode} · {diagnostic}")
+                    raise RuntimeError(f"{description} failed. {diagnostic}\nFFmpeg argv: {invocation}")
             finally:
                 if process.poll() is None:
                     process.kill()
@@ -266,6 +273,9 @@ def decode(path, *input_options):
 
 PREVIEW_HEIGHT = 720
 HDR_TRANSFERS = ("arib-std-b67", "smpte2084")
+SDR_TONEMAP = ("zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,"
+               "zscale=t=bt709:m=bt709:r=tv")
+SDR_TAGS = "setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709"
 
 
 def preview_command(path, start, duration, hardware_decode=False):
@@ -282,8 +292,7 @@ def preview_command(path, start, duration, hardware_decode=False):
         transfer = ""
     picture = f"scale=-2:'min({PREVIEW_HEIGHT},ih)':flags=bicubic"
     if transfer in HDR_TRANSFERS and "zscale" in ffmpeg_features("ffmpeg", "-filters"):
-        picture += (",zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,"
-                    "zscale=t=bt709:m=bt709:r=tv")
+        picture += "," + SDR_TONEMAP
     picture += ",format=yuv420p"
     hardware = ["-hwaccel", "d3d11va"] if hardware_decode else []
     return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *hardware,
@@ -1439,7 +1448,7 @@ def export_clip(source, clip, directory, progress=print, *, audio_offset_ms=0,
                    "-map", "0:V:0", "-map", "0:a?", "-map_chapters", "-1",
                    # Preserve the recording's frame cadence and audio timestamp gaps.
                    "-fps_mode", "passthrough", "-af", audio_filter,
-                   "-c:a", "flac"]
+                   *FLAC_ARGS]
         encode_video(command, streams, encoded, progress, acceleration, duration)
         return publish_export(encoded, directory, stem)
 
@@ -1447,8 +1456,8 @@ def export_clip(source, clip, directory, progress=print, *, audio_offset_ms=0,
 def encode_video(command, streams, encoded, progress, acceleration, duration):
     radeon = command[:1] + RADEON_DECODE_ARGS + command[1:]
     if acceleration.encode:
-        amf = ["-c:v", "h264_amf", "-pix_fmt", "nv12", "-usage", "transcoding", "-quality", "quality",
-               "-rc", "cqp", "-qp_i", "18", "-qp_p", "20", "-qp_b", "22"]
+        amf = ["-c:v", "h264_amf", "-pix_fmt:v", "nv12", "-usage:v", "transcoding", "-quality:v", "quality",
+               "-rc:v", "cqp", "-qp_i:v", "18", "-qp_p:v", "20", "-qp_b:v", "22"]
         plans = [(radeon, "Radeon decoding and AMF encoding")] if acceleration.decode else []
         plans.append((command, "CPU decoding and Radeon AMF encoding"))
         for options, description in plans:
@@ -1474,11 +1483,11 @@ def encode_video(command, streams, encoded, progress, acceleration, duration):
 
 
 def encode_x264(command, streams, encoded, progress, duration):
-    streams = streams + ["-c:v", "libx264", "-crf", "18"]
+    streams = streams + ["-c:v", "libx264", "-crf:v", "18"]
     description = "Radeon decoding and CPU encoding (x264)" if "-hwaccel" in command else "CPU encoding (x264)"
     try:
         run_export(command + ["-threads:v", "2"] + streams
-                   + ["-threads:v", "2", "-preset", "fast", "-x264-params",
+                   + ["-threads:v", "2", "-preset:v", "fast", "-x264-params:v",
                       "rc-lookahead=12:lookahead-threads=1", str(encoded)],
                    description, progress, duration)
     except RuntimeError as error:
@@ -1488,7 +1497,7 @@ def encode_x264(command, streams, encoded, progress, duration):
         encoded.unlink(missing_ok=True)
         progress("Encoder ran out of memory. Retrying with a lower-memory preset.")
         run_export(command + ["-threads:v", "1"] + streams
-                   + ["-threads:v", "1", "-preset", "ultrafast", str(encoded)],
+                   + ["-threads:v", "1", "-preset:v", "ultrafast", str(encoded)],
                    description, progress, duration)
 
 
@@ -1622,12 +1631,76 @@ def export_candidates(result, output, progress, audio_offset_ms, acceleration):
 def montage_segment_info(path):
     info = json.loads(run(["ffprobe", "-v", "error", "-show_entries",
                            "stream=codec_type,codec_name,time_base,width,height,pix_fmt,sample_aspect_ratio,"
-                           "channels,channel_layout,sample_rate,sample_fmt:stream_tags=title,language:format=duration",
+                           "channels,channel_layout,sample_rate,sample_fmt,color_space,color_transfer,"
+                           "color_primaries,color_range:stream_tags=title,language:format=duration",
                            "-of", "json", str(path)]))
     duration = float(info.get("format", {}).get("duration", 0))
     if not math.isfinite(duration) or duration <= 0:
         raise ValueError("Montage segment needs a readable duration.")
     return info["streams"], duration
+
+
+def validate_montage_media(path, audio_count, expected_duration, *, tolerance=.15,
+                           audio_offset=0, video_frames=None):
+    layout, duration = montage_segment_info(path)
+    video = [stream for stream in layout if stream["codec_type"] == "video"]
+    audio = [stream for stream in layout if stream["codec_type"] == "audio"]
+    if len(video) != 1 or len(audio) != audio_count:
+        raise ValueError(f"{path.name} needs one video stream and {audio_count} audio stream(s).")
+    if abs(duration - expected_duration) > tolerance + abs(audio_offset):
+        raise ValueError(f"{path.name} duration is {duration:.3f}s, expected {expected_duration:.3f}s.")
+    packets = run(["ffprobe", "-v", "error", "-show_packets", "-show_entries",
+                   "packet=stream_index,pts_time,duration_time", "-of", "csv=p=0", str(path)])
+    spans = {}
+    frames = 0
+    for row in csv.reader(packets.decode().splitlines()):
+        if len(row) < 3 or not row[0].isdigit() or row[1] == "N/A":
+            continue
+        index, timestamp = int(row[0]), float(row[1])
+        end = timestamp + (0 if row[2] == "N/A" else float(row[2]))
+        if index == 0:
+            frames += 1
+        first, last = spans.get(index, (timestamp, end))
+        spans[index] = min(first, timestamp), max(last, end)
+    if set(spans) != set(range(1 + audio_count)):
+        raise ValueError(f"{path.name} has a stream with no timestamped packets.")
+    if video_frames is not None and frames != video_frames:
+        raise ValueError(f"{path.name} has {frames} frames, expected {video_frames}.")
+    first, last = spans[0]
+    if abs(last - first - expected_duration) > tolerance:
+        raise ValueError(f"{path.name} video packets do not span the expected duration.")
+    for start, end in (spans[index] for index in range(1, audio_count + 1)):
+        if max(abs(start - first), abs(end - last)) > tolerance + abs(audio_offset):
+            raise ValueError(f"{path.name} has audio outside the expected video timing.")
+    run(["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-err_detect", "explode",
+         "-threads", "2", "-i", str(path), "-map", "0:v:0", "-map", "0:a?",
+         "-f", "null", "-"])
+    return layout, duration
+
+
+def reusable_montage_media(path, audio_count, duration, **kwargs):
+    if path.is_file():
+        try:
+            return validate_montage_media(path, audio_count, duration, **kwargs)
+        except (OSError, RuntimeError, ValueError):
+            path.unlink(missing_ok=True)
+    # A settings edit creates a new job. Reuse matching media from suspended jobs
+    # without moving or overwriting files in those jobs.
+    checkpoints = path.parent.parent
+    if checkpoints.name != MONTAGE_CHECKPOINTS:
+        return None
+    for other in checkpoints.glob(f"*/{path.name}"):
+        if other.parent == path.parent or not (other.parent / "job.json").is_file():
+            continue
+        try:
+            os.link(other, path)
+        except OSError:
+            continue
+        try:
+            return validate_montage_media(path, audio_count, duration, **kwargs)
+        except (OSError, RuntimeError, ValueError):
+            path.unlink(missing_ok=True)
+    return None
 
 
 def compatible_montage_layout(layout, expected):
@@ -1640,7 +1713,7 @@ def compatible_montage_layout(layout, expected):
             == {key: value for key, value in expected[1].items() if key != "tags"})
 
 
-def pad_montage_audio(path, destination, present, expected):
+def pad_montage_audio(path, destination, present, expected, progress):
     missing = expected[len(present):]
     if not missing:
         return
@@ -1653,10 +1726,11 @@ def pad_montage_audio(path, destination, present, expected):
     command += ["-t", f"{duration:.3f}", "-map", "0", "-c", "copy"]
     for input_index, stream in enumerate(missing, 1):
         index = len(present) + input_index - 2
-        command += ["-map", f"{input_index}:a:0", f"-c:a:{index}", "flac"]
+        command += ["-map", f"{input_index}:a:0", f"-c:a:{index}", "flac", f"-frame_size:a:{index}", "4096"]
         if stream.get("sample_fmt"):
             command += [f"-sample_fmt:a:{index}", stream["sample_fmt"]]
-    run(command + [str(padded)])
+    run_export(command + [str(padded)], "Adding missing source audio tracks", progress, duration)
+    validate_montage_media(padded, len(expected) - 1, duration)
     padded.replace(destination)
 
 
@@ -1703,7 +1777,8 @@ def montage_audio_settings(segments, reference):
     return settings, orders
 
 
-def normalize_montage_segment(path, destination, width, height, audio, order, progress, acceleration):
+def normalize_montage_segment(path, destination, width, height, audio, order, progress, acceleration,
+                              *, hdr=False, retain_hdr=False):
     converted = path.with_name("working-" + destination.name)
     converted.unlink(missing_ok=True)
     duration = probe(path).duration
@@ -1723,9 +1798,21 @@ def normalize_montage_segment(path, destination, width, height, audio, order, pr
     # Fit the display aspect ratio inside the first recording's canvas.
     filters = (f"scale=w='max(2,trunc(min({width},{height}*dar)/2)*2)':"
                f"h='max(2,trunc(min({height},{width}/dar)/2)*2)',"
-               f"setsar=1,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2,format=yuv420p")
-    streams += ["-vf", filters, "-fps_mode", "passthrough", "-c:a", "flac", "-sample_fmt:a", "s32"]
+               f"setsar=1,pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
+    if retain_hdr:
+        filters += ",format=yuv420p10le"
+        if acceleration.encode:
+            progress("Using CPU encoding to retain 10-bit HDR.")
+            acceleration = VideoAcceleration(decode=acceleration.decode)
+    elif hdr:
+        if "zscale" not in ffmpeg_features("ffmpeg", "-filters"):
+            raise ValueError("Converting a mixed HDR montage requires the FFmpeg zscale filter.")
+        filters += "," + SDR_TONEMAP + ",format=yuv420p," + SDR_TAGS
+    else:
+        filters += ",format=yuv420p," + SDR_TAGS
+    streams += ["-vf", filters, "-fps_mode", "passthrough", *FLAC_ARGS, "-sample_fmt:a", "s32"]
     encode_video(command, streams, converted, progress, acceleration, duration)
+    validate_montage_media(converted, len(audio), duration)
     converted.replace(destination)
 
 
@@ -1778,6 +1865,12 @@ def save_montage_job(sources, candidates, output, audio_offset_ms, *, output_for
         settings["mic_mix_track"] = mic_mix_track
     if style is not None and style.active:
         settings["style"] = asdict(style)
+    # Older plans omit the newly introduced defaults. Keep the original job ID so
+    # selecting the same clips can still find its extraction checkpoints.
+    if "style" in settings:
+        for option in ("slowmo_lead_in", "slowmo_lead_out"):
+            if settings["style"][option] == getattr(MontageStyle(), option):
+                del settings["style"][option]
     plan = json.dumps(settings, ensure_ascii=False).encode("utf-8")
     directory = output / MONTAGE_CHECKPOINTS / hashlib.sha256(plan).hexdigest()
     directory.mkdir(parents=True, exist_ok=True)
@@ -1851,12 +1944,17 @@ def resume_montage_job(job, output, progress=print, *, acceleration=VideoAcceler
                                      style=MontageStyle(**plan["style"]) if plan.get("style") else None)
         if path and not any(result.errors for result in results):
             job.unlink()
-            for cached in [*job.parent.glob("*.mkv"), job.parent / "montage.mp4", job.parent / "segments.txt"]:
+            for cached in [*job.parent.glob("*.mkv"), *job.parent.glob("styled-*.txt"),
+                           job.parent / "montage.mp4", job.parent / "segments.txt"]:
                 try:
                     cached.unlink(missing_ok=True)
                 except OSError as error:
                     progress(f"Could not remove montage cache file {cached.name}. {error}")
         return results, path
+
+
+def montage_cache_key(settings):
+    return hashlib.sha256(json.dumps([MONTAGE_CACHE_VERSION, settings], sort_keys=True).encode()).hexdigest()[:16]
 
 
 def check_montage_pause(stop):
@@ -1878,41 +1976,67 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
         prefix=".quickclip-montage-", dir=output)
     with workspace as temp:
         staging = Path(temp)
+        if checkpoint:
+            notify = progress
+
+            def progress(message):
+                if "FFmpeg " in message or "transition" in message:
+                    with (staging / "ffmpeg.log").open("a", encoding="utf-8") as log:
+                        print(message, file=log)
+                notify(message)
         results = []
         segments = []
         for result in candidates:
             results.append(result)
+            if not result.clips:
+                continue
+            try:
+                audio_count = len(probe(result.source).audio)
+                source_stat = result.source.stat()
+            except (OSError, RuntimeError, ValueError) as error:
+                result.errors.append(f"{result.source.name} · Reading source streams · {error}")
+                continue
             source_index = source_order[result.source]
             for clip_index, clip in enumerate(result.clips, 1):
                 check_montage_pause(stop)
-                path = staging / f"segment-{source_index:06d}-{clip_index:06d}.mkv"
-                label = f"{result.source.name} · Clip {clip_index}/{len(result.clips)}"
+                key = montage_cache_key([str(result.source.resolve()), source_stat.st_size,
+                                         source_stat.st_mtime_ns, clip.start, clip.end, audio_offset_ms])
+                name = f"segment-{source_index:06d}-{clip_index:06d}"
+                path = staging / f"{name}-{key}.mkv"
+                legacy = staging / f"{name}.mkv"
+                label = f"{result.source.name} · Clip {clip_index}/{len(result.clips)} at {clip.start:.2f}s"
 
                 def report(message):
                     progress(f"{label} · {message}")
 
                 try:
-                    layout = None
-                    if path.is_file():
+                    expected_duration = clip.end - clip.start
+                    timing = {"audio_offset": audio_offset_ms / 1000}
+                    cached = reusable_montage_media(path, audio_count, expected_duration, **timing)
+                    if cached is None and legacy.is_file():
                         try:
-                            layout, duration = montage_segment_info(path)
-                            report("Reusing encoded clip.")
-                        except (OSError, RuntimeError, ValueError):
-                            path.unlink(missing_ok=True)
-                    if layout is None:
+                            cached = validate_montage_media(legacy, audio_count, expected_duration, **timing)
+                        except (OSError, RuntimeError, ValueError) as error:
+                            report(f"Regenerating invalid intermediate. {error}")
+                        else:
+                            legacy.replace(path)
+                    if cached is not None:
+                        layout, duration = cached
+                        report("Reusing encoded clip.")
+                    else:
                         report(f"Exporting {clip.start:.2f}–{clip.end:.2f}s")
                         with tempfile.TemporaryDirectory(prefix=".clip-", dir=staging) as scratch:
                             encoded = export_clip(result.source, clip, Path(scratch), progress=report,
                                                   audio_offset_ms=audio_offset_ms, acceleration=acceleration)
-                            layout, duration = montage_segment_info(encoded)
+                            layout, duration = validate_montage_media(encoded, audio_count, expected_duration, **timing)
                             encoded.replace(path)
                 except (OSError, RuntimeError, ValueError) as error:
-                    result.errors.append(f"Clip at {clip.start:.2f}s: {error}")
+                    result.errors.append(f"{label} · Extracting intermediate · {error}")
                     continue
                 result.exports.append(path)
                 segments.append(MontageSegment(path, layout, duration, result, clip))
         check_montage_pause(stop)
-        if not segments:
+        if not segments or any(result.errors for result in results):
             return results, None
         segments.sort(key=lambda segment: source_order[segment.result.source])
         if style.active:
@@ -1931,38 +2055,44 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
         if mic_mix_track is not None and (len(audio) < 2 or mic_mix_track > len(audio)):
             progress(f"Montage has {len(audio)} audio track(s). Mic mix for track {mic_mix_track} skipped.")
             mic_mix_track = None
+        colour_metadata = {(item.layout[0].get("color_transfer"), item.layout[0].get("color_primaries"),
+                            item.layout[0].get("color_space"), item.layout[0].get("color_range"))
+                           for item in segments}
+        retain_hdr = len(colour_metadata) == 1 and next(iter(colour_metadata))[0] in HDR_TRANSFERS
         ready = []
         for index, (segment, order) in enumerate(zip(segments, orders), 1):
             check_montage_pause(stop)
             try:
                 if mixed:
-                    key = hashlib.sha256(json.dumps([width, height, audio, order], sort_keys=True).encode()).hexdigest()[:12]
+                    key = montage_cache_key([width, height, audio, order, retain_hdr])
                     destination = staging / f"ready-{key}-{segment.path.name}"
 
                     def report(message):
                         progress(f"Converting clip {index}/{len(segments)} · {message}")
 
-                    if destination.is_file():
+                    if reusable_montage_media(destination, len(audio), segment.duration):
                         report("Reusing converted clip.")
                     else:
                         report(segment.result.source.name)
                         normalize_montage_segment(segment.path, destination, width, height, audio,
-                                                  order, report, acceleration)
+                                                  order, report, acceleration, retain_hdr=retain_hdr,
+                                                  hdr=segment.layout[0].get("color_transfer") in HDR_TRANSFERS)
                 elif len(segment.layout) < len(expected):
-                    key = hashlib.sha256(json.dumps(expected, sort_keys=True).encode()).hexdigest()[:12]
+                    key = montage_cache_key(expected)
                     destination = staging / f"padded-{key}-{segment.path.name}"
-                    if not destination.is_file():
-                        pad_montage_audio(segment.path, destination, segment.layout, expected)
+                    if not reusable_montage_media(destination, len(expected) - 1, segment.duration):
+                        pad_montage_audio(segment.path, destination, segment.layout, expected, progress)
                 else:
                     destination = segment.path
                 duration = segment.duration if destination == segment.path else montage_segment_info(destination)[1]
             except (OSError, RuntimeError, ValueError) as error:
-                segment.result.errors.append(f"Could not prepare {segment.path.name} for the montage. {error}")
+                segment.result.errors.append(f"{segment.result.source.name} · Clip at {segment.clip.start:.2f}s"
+                                             f" · Normalizing intermediate · {error}")
                 segment.result.exports.remove(segment.path)
                 continue
             ready.append((destination.name, duration))
         check_montage_pause(stop)
-        if not ready:
+        if len(ready) != len(segments):
             return results, None
         total_duration = sum(duration for _, duration in ready)
         progress(f"Joining montage · 0% · {len(ready)} highlight segment(s)")
@@ -1990,7 +2120,7 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
         else:
             command += ["-c:a", "copy"]
             if mic_mix_track is not None:
-                command += ["-c:a:0", "flac"]
+                command += ["-c:a:0", "flac", "-frame_size:a:0", "4096"]
         for index, stream in enumerate(audio, start=int(mic_mix_track is not None)):
             if mic_mix_track is not None:
                 command += [f"-disposition:a:{index}", "0"]
@@ -1998,6 +2128,8 @@ def write_montage(sources, candidates, output, progress=print, *, audio_offset_m
             for key in (*title_keys, "language"):
                 command += [f"-metadata:s:a:{index}", f"{key}={tags.get('title' if key == 'handler_name' else key, '')}"]
         run_export(command + [str(encoded)], "Joining montage", progress, total_duration)
+        validate_montage_media(encoded, len(audio) + int(mic_mix_track is not None), total_duration,
+                               tolerance=.15 + len(ready) * .01, audio_offset=audio_offset_ms / 1000)
         destination = publish_export(encoded, output, "kill-montage")
         progress(f"Joining montage · 100% · {output_format.upper()} saved")
         return results, destination
@@ -2020,6 +2152,8 @@ class MontageStyle:
     slowmo_multikills: bool = False
     slowmo_speed: float = .5
     mic_at_kills: bool = False
+    slowmo_lead_in: float = .5
+    slowmo_lead_out: float = .85
 
     def __post_init__(self):
         if self.transition not in TRANSITIONS:
@@ -2030,6 +2164,8 @@ class MontageStyle:
             raise ValueError("Transition length must be between 0.1 and 2 seconds.")
         if not .25 <= self.slowmo_speed < 1:
             raise ValueError("Slow motion speed must be between 0.25 and 1.")
+        if any(not 0 <= value <= MULTI_KILL_GAP for value in (self.slowmo_lead_in, self.slowmo_lead_out)):
+            raise ValueError("Slow motion lead-in and lead-out must be between 0 and 3 seconds.")
 
     @property
     def active(self):
@@ -2045,29 +2181,63 @@ def clip_kills(clip):
             counts.setdefault(time, 1)
         elif reason.startswith(KILL_COUNT_PREFIX):
             counts[time] = max(counts.get(time, 1), int(reason.removeprefix(KILL_COUNT_PREFIX)))
-    return sorted((time - clip.start, count) for time, count in counts.items())
+    sources = {}
+    for time, reason in clip.cues:
+        if reason in KILL_CUES:
+            sources.setdefault(time, set()).add(reason)
+    events = []
+    for time, count in sorted(counts.items()):
+        cues = sources.get(time, set())
+        if events and time - events[-1][0] <= .5 and cues and events[-1][2] and not cues & events[-1][2]:
+            previous, old_count, old_cues = events[-1]
+            events[-1] = previous, max(count, old_count), old_cues | cues
+        else:
+            events.append((time, count, cues))
+    return [(time - clip.start, count) for time, count, _ in events]
 
 
-def multi_kill_windows(kills, duration):
+def multi_kill_windows(kills, duration, lead_in=.5, lead_out=.85):
     windows = []
+    distinct = {}
+    for time, count in kills:
+        distinct[time] = max(count, distinct.get(time, 0))
     group = []
-    for time, count in kills + [(math.inf, 0)]:
+    for time, count in sorted(distinct.items()) + [(math.inf, 0)]:
         if group and time - group[-1][0] > MULTI_KILL_GAP:
             if sum(count for _, count in group) >= 2:
-                windows.append((max(0, group[0][0] - .4), min(duration, group[-1][0] + 1.2)))
+                start = max(0, group[0][0] - lead_in)
+                end = min(duration, group[-1][0] + lead_out)
+                if start < end:
+                    windows.append((start, end))
             group = []
         group.append((time, count))
-    return [window for window in windows if window[1] - window[0] > .2]
+    return windows
 
 
-def speed_parts(duration, windows, speed):
-    """Split 0..duration into (start, end, speed) parts."""
+def speed_parts(duration, windows, speed, *, entry=0, exit=0):
+    """Split the source into adjacent speed intervals, merging any overlap."""
+    merged = []
+    for start, end in sorted(windows):
+        start, end = max(0, start), min(duration, end)
+        if start >= end:
+            continue
+        if merged and start <= merged[-1][1]:
+            merged[-1] = merged[-1][0], max(end, merged[-1][1])
+        else:
+            merged.append((start, end))
     parts = []
     position = 0
-    for start, end in windows:
+    for start, end in merged:
         if start > position:
             parts.append((position, start, 1))
-        parts.append((start, end, speed))
+        ease_in = entry if start > 0 and end - start > entry + exit else 0
+        ease_out = exit if end < duration and end - start > entry + exit else 0
+        ramp_speed = (1 + speed) / 2
+        if ease_in:
+            parts.append((start, start + ease_in, ramp_speed))
+        parts.append((start + ease_in, end - ease_out, speed))
+        if ease_out:
+            parts.append((end - ease_out, end, ramp_speed))
         position = end
     if position < duration:
         parts.append((position, duration, 1))
@@ -2099,7 +2269,7 @@ def transition_filter(name, seconds):
     xfade = {"Flip": "custom:expr='" + flip_expression() + "'", "Whip pan": "slideleft",
              "Zoom punch": "zoomin", "Flash": "fadewhite", "Pixelate": "pixelize", "Slide": "smoothup"}[name]
     after = ",tmix=frames=5" if name == "Whip pan" else ""
-    return f"xfade=transition={xfade}:duration={seconds:.3f}:offset=0{after}"
+    return f"xfade=transition={xfade}:duration={seconds:.6f}:offset=0{after}"
 
 
 @dataclass
@@ -2115,16 +2285,10 @@ class StyledSegment:
     source_duration: float
 
 
-def styled_streams(segment, index, style, size, can_tonemap):
+def styled_streams(segment, index, style, size, start_frame, end_frame):
     """Filters that turn input `index` into a styled [v{index}] and stereo [a{index}]."""
     width, height = size
-    video = f"[{index}:v:0]setpts=PTS-STARTPTS,fps={segment.rate}"
-    if segment.hdr and can_tonemap:
-        # Bring HLG/PQ captures to SDR so phones and social sites show the right colours.
-        tonemap = ("zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,"
-                   "zscale=t=bt709:m=bt709:r=tv")
-    else:
-        tonemap = None
+    video = f"[{index}:v:0]setpts=PTS-STARTPTS,fps={segment.rate},settb=AVTB"
     if style.vertical == "9:16 blurred fill":
         geometry = (f"split=2[bg{index}][fg{index}];"
                     f"[bg{index}]scale={width // 4}:{height // 4}:force_original_aspect_ratio=increase,"
@@ -2136,7 +2300,11 @@ def styled_streams(segment, index, style, size, can_tonemap):
         geometry = (f"scale=w='max(2,trunc(min({width},{height}*dar)/2)*2)':"
                     f"h='max(2,trunc(min({height},{width}/dar)/2)*2)',pad={width}:{height}:(ow-iw)/2:(oh-ih)/2")
     # Frame first, then tone map and convert the (smaller) final picture.
-    finish = (("," + tonemap) if tonemap else "") + ",format=yuv420p"
+    finish = (("," + SDR_TONEMAP) if segment.hdr else "") + ",format=yuv420p,setsar=1," + SDR_TAGS
+    fps = float(Fraction(segment.rate))
+    # Detailed scaling and tone mapping only need the frames this piece uses.
+    trim = (f"tpad=stop_mode=clone:stop={end_frame},"
+            f"trim=start_frame={start_frame}:end_frame={end_frame},setpts=PTS-STARTPTS,")
     graph = []
     head = video
     audio = (f"[{index}:a:{segment.main}]" if segment.main is not None
@@ -2147,23 +2315,39 @@ def styled_streams(segment, index, style, size, can_tonemap):
         graph.append(f"[{index}:a:{segment.mic}]aresample=48000:async=1:first_pts=0,"
                      f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
                      f"volume='{envelope}':eval=frame[mic{index}]")
-        audio += f"[game{index}];[game{index}][mic{index}]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95"
-    if len(segment.parts) > 1:
+        audio += f"[game{index}];[game{index}][mic{index}]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95:latency=1"
+    if any(speed != 1 for _, _, speed in segment.parts):
         graph.append(head + f",split={len(segment.parts)}" + "".join(f"[vp{index}_{n}]" for n in range(len(segment.parts))))
         graph.append(audio + f",asplit={len(segment.parts)}" + "".join(f"[ap{index}_{n}]" for n in range(len(segment.parts))))
-        pieces = []
+        video_pieces, audio_pieces = [], []
         for n, (start, end, speed) in enumerate(segment.parts):
-            graph.append(f"[vp{index}_{n}]trim=start={start:.3f}:end={end:.3f},setpts=(PTS-STARTPTS)/{speed}[vq{index}_{n}]")
-            tempo = "" if speed == 1 else (f",atempo={speed}" if speed >= .5 else f",atempo=0.5,atempo={speed / .5:.4f}")
-            graph.append(f"[ap{index}_{n}]atrim=start={start:.3f}:end={end:.3f},asetpts=PTS-STARTPTS"
-                         + tempo + f"[aq{index}_{n}]")
-            pieces.append(f"[vq{index}_{n}][aq{index}_{n}]")
-        graph.append("".join(pieces) + f"concat=n={len(segment.parts)}:v=1:a=1[vs{index}][a{index}]")
-        graph.append(f"[vs{index}]fps={segment.rate}," + geometry + finish + f",setsar=1[v{index}]")
+            length = round((end - start) * fps / speed) / fps
+            video_pieces.append(f"[vq{index}_{n}]")
+            audio_pieces.append(f"[aq{index}_{n}]")
+            start_frame, stop_frame = round(start * fps), round(end * fps)
+            frames = round(length * fps)
+            graph.append(f"[vp{index}_{n}]trim=start_frame={start_frame}:end_frame={stop_frame},"
+                         f"setpts=(PTS-STARTPTS)/{speed},fps={segment.rate},"
+                         f"tpad=stop_mode=clone:stop={frames},trim=end_frame={frames}"
+                         + video_pieces[-1])
+            tempo = "" if speed == 1 else (f",atempo={speed}" if speed >= .5 else f",atempo=0.5,atempo={speed / .5:.6f}")
+            graph.append(f"[ap{index}_{n}]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
+                         + tempo + f",apad,atrim=duration={length:.6f}" + audio_pieces[-1])
+        graph.append("".join(video_pieces) + f"concat=n={len(segment.parts)}:v=1:a=0[vs{index}]")
+        graph.append("".join(audio_pieces) + f"concat=n={len(segment.parts)}:v=0:a=1[a{index}]")
+        graph.append(f"[vs{index}]fps={segment.rate}," + trim + geometry + finish + f"[v{index}]")
     else:
-        graph.append(head + "," + geometry + finish + f",setsar=1[v{index}]")
-        graph.append(audio + f"[a{index}]")
+        graph.append(head + "," + trim + geometry + finish + f"[v{index}]")
+        graph.append(audio + f",apad,atrim=duration={segment.duration:.6f}[a{index}]")
     return graph
+
+
+def montage_transitions(transition, count, seed):
+    if transition != "Random":
+        return [transition] * count
+    names = [name for name in TRANSITIONS if name not in ("None", "Random")]
+    Random(seed).shuffle(names)
+    return [names[index % len(names)] for index in range(count)]
 
 
 def styled_montage(segments, staging, output, output_format, mic_mix_track, style, progress, acceleration, stop):
@@ -2177,47 +2361,72 @@ def styled_montage(segments, staging, output, output_format, mic_mix_track, styl
     can_tonemap = "zscale" in ffmpeg_features("ffmpeg", "-filters")
     styled = []
     for segment in segments:
-        streams, duration = montage_segment_info(segment.path)
+        streams, duration = segment.layout, segment.duration
         video = json.loads(run(["ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries",
                                 "stream=width,height,avg_frame_rate,r_frame_rate,color_transfer",
                                 "-of", "json", str(segment.path)]))["streams"][0]
         audio = [stream for stream in streams if stream["codec_type"] == "audio"]
         titles = [stream.get("tags", {}).get("title", "").casefold().strip() for stream in audio]
-        mic = mic_mix_track - 1 if mic_mix_track is not None and mic_mix_track <= len(audio) else None
+        mic = (mic_mix_track - 1 if len(audio) > 1 and mic_mix_track is not None
+               and mic_mix_track <= len(audio) else None)
         others = [index for index in range(len(audio)) if index != mic]
         main = next((index for index in others if titles[index] in ("game", "game audio")),
                     others[0] if others else None)
         kills = clip_kills(segment.clip)
-        windows = multi_kill_windows(kills, duration) if style.slowmo_multikills else []
-        parts = speed_parts(duration, windows, style.slowmo_speed)
+        windows = multi_kill_windows(kills, duration, style.slowmo_lead_in,
+                                     style.slowmo_lead_out) if style.slowmo_multikills else []
         rate = video.get("avg_frame_rate") or video.get("r_frame_rate") or "60"
         if rate in ("0/0", "0"):
             rate = "60"
-        styled.append(StyledSegment(segment.path, sum((end - start) / speed for start, end, speed in parts), parts,
+        if styled:
+            rate = styled[0].rate
+        fps = float(Fraction(rate))
+        # Keep source cuts on frame boundaries so each part has a picture to retime.
+        duration = max(1, round(duration * fps)) / fps
+        windows = [(round(start * fps) / fps, round(end * fps) / fps) for start, end in windows]
+        entry, exit = (int(min(.2, lead) * fps) / fps
+                       for lead in (style.slowmo_lead_in, style.slowmo_lead_out))
+        parts = speed_parts(duration, windows, style.slowmo_speed, entry=entry, exit=exit)
+        frames = sum(round((end - start) * fps / speed) for start, end, speed in parts)
+        styled.append(StyledSegment(segment.path, frames / fps, parts,
                                     main, mic, kills, rate,
-                                    video.get("color_transfer") in ("arib-std-b67", "smpte2084"), duration))
+                                    video.get("color_transfer") in HDR_TRANSFERS, duration))
         if len(styled) == 1:
             first = video
     size = VERTICAL_SIZE if style.vertical != "Off" else (max(2, first["width"] // 2 * 2), max(2, first["height"] // 2 * 2))
-    rate = styled[0].rate
-    for item in styled:
-        item.rate = rate
-    gap = style.transition_seconds if style.transition != "None" else 0
-    if gap:
-        gap = min(gap, min(item.duration for item in styled) / 3)
-    # Random goes through every transition in a shuffled order before repeating one.
-    names = [name for name in TRANSITIONS if name not in ("None", "Random")]
-    Random(":".join(item.path.name for item in styled)).shuffle(names)
-    sdr = can_tonemap or not any(item.hdr for item in styled)
-    key = hashlib.sha256(json.dumps([asdict(style), mic_mix_track, size, gap, can_tonemap,
-                                     [item.path.name for item in styled]]).encode()).hexdigest()[:12]
+    if not can_tonemap and any(item.hdr for item in styled):
+        raise ValueError("Styled HDR montages require an FFmpeg build with the zscale filter.")
+    fps = float(Fraction(styled[0].rate))
+    gap = 0
+    if style.transition != "None" and len(styled) > 1:
+        gap_frames = min(round(style.transition_seconds * fps),
+                         int(min(item.duration for item in styled) * fps / 3))
+        gap = gap_frames / fps
+    if style.transition == "Random":
+        plan_key = montage_cache_key([item.path.name for item in styled])
+        plan_path = staging / f"transitions-{plan_key}.json"
+        if plan_path.is_file():
+            names = json.loads(plan_path.read_text(encoding="utf-8"))
+        else:
+            # Reconstruct the deterministic selection used by pre-plan saved jobs.
+            seed = ":".join(item.path.name.rsplit("-", 1)[0] + ".mkv" for item in styled)
+            names = montage_transitions(style.transition, len(styled) - 1, seed)
+            working_plan = plan_path.with_suffix(".tmp")
+            working_plan.write_text(json.dumps(names), encoding="utf-8")
+            working_plan.replace(plan_path)
+    else:
+        names = [style.transition] * (len(styled) - 1)
+    piece_keys = []
     pieces = []
     total = sum(item.duration for item in styled) - gap * (len(styled) - 1)
 
     def encode_piece(name, inputs, graph, label, duration):
+        key = montage_cache_key([[path.name for path in inputs], graph, round(duration, 6)])
         destination = staging / f"styled-{key}-{name}.mkv"
+        piece_keys.append(key)
         pieces.append(destination)
-        if destination.is_file():
+        checks = {"video_frames": round(duration * fps), "tolerance": max(1.5 / fps, .04)}
+        if reusable_montage_media(destination, 1, duration, **checks):
             progress(f"{label} · Reusing encoded piece.")
             return
         check_montage_pause(stop)
@@ -2225,47 +2434,61 @@ def styled_montage(segments, staging, output, output_format, mic_mix_track, styl
         working.unlink(missing_ok=True)
         command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-filter_threads", "2"]
         streams = []
-        for path in inputs:
+        for index, path in enumerate(inputs):
+            if index:
+                streams += ["-threads:v", "2"]
             streams += ["-i", str(path)]
-        streams += ["-filter_complex", ";".join(graph), "-map", "[vout]", "-map", "[aout]", "-c:a", "flac"]
-        if sdr:
-            streams += ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
-        encode_video(command, streams, working, lambda message: progress(f"{label} · {message}"),
-                     acceleration, duration)
+        streams += ["-filter_complex_threads", "2", "-filter_complex", ";".join(graph),
+                    "-map", "[vout]", "-map", "[aout]", "-t", f"{duration:.6f}", *FLAC_ARGS,
+                    "-sample_fmt:a", "s32"]
+        streams += ["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv"]
+        try:
+            encode_video(command, streams, working, lambda message: progress(f"{label} · {message}"),
+                         acceleration, duration)
+            validate_montage_media(working, 1, duration, **checks)
+        except (OSError, RuntimeError, ValueError) as error:
+            working.unlink(missing_ok=True)
+            raise RuntimeError(f"{label} · {error}") from error
         working.replace(destination)
 
     for index, item in enumerate(styled):
         head = gap if index > 0 else 0
         tail = gap if index < len(styled) - 1 else 0
-        graph = styled_streams(item, 0, style, size, can_tonemap)
-        graph.append(f"[v0]trim=start={head:.3f}:end={item.duration - tail:.3f},setpts=PTS-STARTPTS[vout]")
-        graph.append(f"[a0]atrim=start={head:.3f}:end={item.duration - tail:.3f},asetpts=PTS-STARTPTS[aout]")
-        encode_piece(f"{index:04d}-body", [item.path], graph, f"Styling clip {index + 1}/{len(styled)}",
+        source_label = f"{segments[index].result.source.name} at {segments[index].clip.start:.2f}s"
+        head_frame, tail_frame = round(head * fps), round((item.duration - tail) * fps)
+        graph = styled_streams(item, 0, style, size, head_frame, tail_frame)
+        graph.append("[v0]null[vout]")
+        graph.append(f"[a0]atrim=start={head:.6f}:end={item.duration - tail:.6f},asetpts=PTS-STARTPTS[aout]")
+        encode_piece(f"{index:04d}-body", [item.path], graph, f"Styling clip {index + 1}/{len(styled)} · {source_label}",
                      item.duration - head - tail)
         if tail:
             following = styled[index + 1]
-            name = style.transition if style.transition != "Random" else names[index % len(names)]
-            graph = styled_streams(item, 0, style, size, can_tonemap) + styled_streams(following, 1, style, size, can_tonemap)
-            graph.append(f"[v0]trim=start={item.duration - gap:.3f},setpts=PTS-STARTPTS[va]")
-            graph.append(f"[v1]trim=end={gap:.3f},setpts=PTS-STARTPTS[vb]")
-            graph.append(f"[va][vb]{transition_filter(name, gap)},format=yuv420p[vout]")
-            graph.append(f"[a0]atrim=start={item.duration - gap:.3f},asetpts=PTS-STARTPTS[aa]")
-            graph.append(f"[a1]atrim=end={gap:.3f},asetpts=PTS-STARTPTS[ab]")
-            graph.append(f"[aa][ab]acrossfade=d={gap:.3f}:c1=tri:c2=tri[aout]")
+            name = names[index]
+            graph = styled_streams(item, 0, style, size, tail_frame, tail_frame + gap_frames)
+            graph += styled_streams(following, 1, style, size, 0, gap_frames)
+            graph.append(f"[v0]settb=1/({item.rate})[va]")
+            graph.append(f"[v1]settb=1/({item.rate})[vb]")
+            graph.append(f"[va][vb]{transition_filter(name, gap)},format=yuv420p,trim=end_frame={gap_frames}[vout]")
+            graph.append(f"[a0]atrim=start={item.duration - gap:.6f},asetpts=PTS-STARTPTS[aa]")
+            graph.append(f"[a1]atrim=end={gap:.6f},asetpts=PTS-STARTPTS[ab]")
+            graph.append(f"[aa][ab]acrossfade=d={gap:.6f}:c1=tri:c2=tri[aout]")
             encode_piece(f"{index:04d}-transition", [item.path, following.path], graph,
-                         f"{name} transition {index + 1}/{len(styled) - 1}", gap)
+                         f"{name} transition {index + 1}/{len(styled) - 1} · {source_label} → "
+                         f"{segments[index + 1].result.source.name} at {segments[index + 1].clip.start:.2f}s", gap)
     check_montage_pause(stop)
     progress(f"Joining montage · 0% · {len(styled)} highlight segment(s)")
-    manifest = staging / f"styled-{key}.txt"
+    manifest = staging / f"styled-{montage_cache_key(piece_keys)}.txt"
     manifest.write_text("".join(f"file '{path.name}'\n" for path in pieces), encoding="utf-8")
     encoded = staging / f"montage.{output_format}"
     command = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                "-f", "concat", "-safe", "0", "-i", str(manifest), "-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy"]
     command += ["-c:a", "aac", "-b:a", "320k", "-movflags", "+faststart"] if output_format == "mp4" else ["-c:a", "copy"]
-    title = "Game + mic" if mic_mix_track is not None else "Game"
+    title = "Game + mic" if any(item.mic is not None for item in styled) else "Game"
     for key_name in (("title", "handler_name") if output_format == "mp4" else ("title",)):
         command += ["-metadata:s:a:0", f"{key_name}={title}"]
     run_export(command + [str(encoded)], "Joining montage", progress, total)
+    validate_montage_media(encoded, 1, total, tolerance=.15 + len(pieces) * .01,
+                           video_frames=round(total * fps))
     destination = publish_export(encoded, output, "kill-montage-vertical" if style.vertical != "Off" else "kill-montage")
     progress(f"Joining montage · 100% · {output_format.upper()} saved")
     return destination
