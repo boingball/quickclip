@@ -74,7 +74,7 @@ Each kill is reported once, when another line with your name appears on the kill
 
 For Battlefield 6, choose **Local contrast**. The game draws your own name in near-white with a ▸ marker, not in your squad's green, and the feed is translucent: over bright sky your name is only about 15 brightness levels from the background, and mostly visible by its outline. **Local contrast** stretches each pixel between the darkest and brightest values around it, which keeps those names readable without depending on color. The command-line equivalent is `--feed-text-mode local`. Your player name is matched without regard to case, and with one common OCR substitution such as `0` for `O`. On sample BF6 replays it found 11 of 11 kills with no false clips, against 9 of 11 for **Grayscale** and none for **Green player**.
 
-HDR recordings (for example 10-bit HLG) are read as they are stored, without tone mapping. Tone mapping made no difference to OCR in testing.
+HDR recordings (for example BF6's 10-bit HLG replays) are converted to 8 bits before OCR, without tone mapping. Tone mapping made no difference to OCR in testing.
 
 If your name is always green, try **Green player**. QuickClip requires the matching name to be green and keeps the other colored names visible for the killer-side check. For names of at least six letters or digits, every mode also accepts one common OCR substitution, such as `l` for `i` or `o` for `0`. **OCR readout** lists those spellings separately for review. **Test feed OCR** marks the words it classified as green. The command-line equivalent is `--feed-text-mode green`.
 
