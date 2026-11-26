@@ -23,7 +23,7 @@ from quickclip import (
     make_skull_reference, preview_feed, preview_kill_badge, probe, process_batch, resolve_video_acceleration,
     resume_montage_job, run, save_montage_job, scan_kills, skull_search_area, skull_search_preview,
     WeaponReference, clip_preview_frames, filter_recording_dates, make_weapon_reference, recognize_weapon,
-    recording_date,
+    recording_date, MontageStyle, TRANSITIONS, VERTICAL_MODES,
 )
 from scan_review import SavedScan
 
@@ -122,6 +122,8 @@ class Desktop:
         self.radeon_encode = tk.BooleanVar()
         self.radeon_decode = tk.BooleanVar()
         self.shutdown_when_finished = tk.BooleanVar()
+        self.slowmo_multikills = tk.BooleanVar()
+        self.mic_at_kills = tk.BooleanVar()
         self.skull_reference = None
         self.weapon_references = ()
 
@@ -166,6 +168,10 @@ class Desktop:
         self.montage_format = ttk.Combobox(settings, state="readonly", values=("MKV", "MP4"), width=7)
         self.montage_format.current(0)
         self.mic_mix_track = ttk.Entry(settings, width=8)
+        self.montage_transition = ttk.Combobox(settings, state="readonly", values=TRANSITIONS, width=12)
+        self.montage_transition.current(0)
+        self.montage_vertical = ttk.Combobox(settings, state="readonly", values=VERTICAL_MODES, width=18)
+        self.montage_vertical.current(0)
         for field, value in ((self.threshold, "-18"), (self.before, "10"), (self.after, "6")):
             field.insert(0, value)
         settings_fields = (
@@ -180,6 +186,8 @@ class Desktop:
             ("Export audio offset (ms)", self.audio_offset, 4, 0),
             ("Montage format", self.montage_format, 8, 0),
             ("Mix mic track (optional)", self.mic_mix_track, 8, 2),
+            ("Montage transition", self.montage_transition, 9, 0),
+            ("Vertical for TikTok", self.montage_vertical, 9, 2),
         )
         for label, field, row, column in settings_fields:
             ttk.Label(settings, text=label).grid(row=row, column=column, sticky="w", padx=(0, 8))
@@ -198,6 +206,10 @@ class Desktop:
             row=7, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(settings, text="Radeon hardware decoding", variable=self.radeon_decode).grid(
             row=6, column=2, columnspan=2, sticky="w")
+        ttk.Checkbutton(settings, text="Slow motion on multi-kills", variable=self.slowmo_multikills).grid(
+            row=10, column=0, columnspan=2, sticky="w")
+        ttk.Checkbutton(settings, text="Mic only around kills", variable=self.mic_at_kills).grid(
+            row=10, column=2, columnspan=2, sticky="w")
         shutdown = ttk.Checkbutton(settings, text="Shut down PC after montage", variable=self.shutdown_when_finished)
         shutdown.grid(row=7, column=2, columnspan=2, sticky="w")
         if not self.can_shutdown:
@@ -335,6 +347,12 @@ class Desktop:
             self.montage_cue.set(values["montage_cue"])
         if values.get("montage_format") in self.montage_format["values"]:
             self.montage_format.set(values["montage_format"])
+        if values.get("montage_transition") in TRANSITIONS:
+            self.montage_transition.set(values["montage_transition"])
+        if values.get("montage_vertical") in VERTICAL_MODES:
+            self.montage_vertical.set(values["montage_vertical"])
+        self.slowmo_multikills.set(values.get("slowmo_multikills") is True)
+        self.mic_at_kills.set(values.get("mic_at_kills") is True)
         stored_reference = values.get("skull_reference")
         if isinstance(stored_reference, dict):
             try:
@@ -364,6 +382,8 @@ class Desktop:
                       feed_mode=self.feed_mode.get(), feed_divider=self.feed_divider.get(),
                       fixed_feed_divider=self.fixed_feed_divider.get(), montage_cue=self.montage_cue.get(),
                       montage_format=self.montage_format.get(),
+                      montage_transition=self.montage_transition.get(), montage_vertical=self.montage_vertical.get(),
+                      slowmo_multikills=self.slowmo_multikills.get(), mic_at_kills=self.mic_at_kills.get(),
                       from_date=self.from_date.get(), to_date=self.to_date.get(),
                       radeon_encode=self.radeon_encode.get(), radeon_decode=self.radeon_decode.get())
         if self.skull_reference is not None:
@@ -1419,6 +1439,10 @@ class Desktop:
             mic_mix = self.mic_mix_track.get().strip()
             if mic_mix and (not re.fullmatch(r"[0-9]+", mic_mix) or int(mic_mix) < 1):
                 raise ValueError("Enter a positive mic track number for the montage mix, or leave it blank.")
+            if self.mic_at_kills.get() and not mic_mix:
+                raise ValueError("Enter the mic track number in Mix mic track to use Mic only around kills.")
+            style = MontageStyle(transition=self.montage_transition.get(), vertical=self.montage_vertical.get(),
+                                 slowmo_multikills=self.slowmo_multikills.get(), mic_at_kills=self.mic_at_kills.get())
         except ValueError as error:
             messagebox.showerror("QuickClip", str(error))
             return
@@ -1431,7 +1455,7 @@ class Desktop:
         output_format = self.montage_format.get().lower()
         self.start_montage_export(directory, lambda: save_montage_job(
             self.sources, candidates, directory, audio_offset,
-            output_format=output_format, mic_mix_track=int(mic_mix) if mic_mix else None))
+            output_format=output_format, mic_mix_track=int(mic_mix) if mic_mix else None, style=style))
 
     def resume_montage(self):
         directory = self.output or self.default_output
