@@ -24,7 +24,7 @@ from quickclip import (
     resume_montage_job, run, save_montage_job, scan_kills, skull_search_area, skull_search_preview,
     WeaponReference, clip_preview_frames, filter_recording_dates, make_weapon_reference, recognize_weapon,
     recording_date, MontageStyle, TRANSITIONS, VERTICAL_MODES, matches_weapons, parse_weapon_filter, settings_path,
-    load_presets, merge_weapon_references,
+    load_presets, merge_weapon_references, preview_command,
 )
 from scan_review import SavedScan
 
@@ -1566,12 +1566,26 @@ class Desktop:
         if (self.busy and not self.montage_scanning) or not selected or not player:
             return
         source, clip = self.clips[int(selected[0])]
-        try:
-            subprocess.Popen([player, "-loglevel", "error", "-autoexit",
-                              "-ss", f"{clip.start:.3f}", "-t", f"{clip.end - clip.start:.3f}",
-                              str(source)])
-        except OSError as error:
-            messagebox.showerror("QuickClip", str(error))
+        if shutil.which("ffmpeg") is None:
+            messagebox.showerror("QuickClip", "Install ffmpeg and add it to PATH.")
+            return
+        radeon = self.radeon_decode.get()
+
+        def play():
+            # FFmpeg prepares a small SDR picture; FFplay only shows it, in a normal-sized window.
+            try:
+                decode = radeon and resolve_video_acceleration(VideoAcceleration(False, True), lambda _: None).decode
+                feeder = subprocess.Popen(preview_command(source, clip.start, clip.end - clip.start, decode),
+                                          stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+                subprocess.Popen([player, "-loglevel", "error", "-autoexit", "-window_title",
+                                  f"{Path(source).name} {clock(clip.start)}", "-"],
+                                 stdin=feeder.stdout)
+                feeder.stdout.close()
+            except (OSError, RuntimeError) as error:
+                # A progress message only updates the status line, so a running scan carries on.
+                self.messages.put(("progress", f"Could not play the clip. {error}"))
+
+        Thread(target=play, daemon=True).start()
 
     def read_audio_offset(self):
         try:
