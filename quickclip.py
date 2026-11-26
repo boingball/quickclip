@@ -702,7 +702,14 @@ def make_weapon_reference(frame, rows, bounds, label, mode):
     for row in rows:
         anchor = weapon_anchor(row)
         if anchor is None:
-            continue
+            # Without a readable victim, anchor on the nearest name to the left of the icon.
+            killers = [word for word in row.words if NAME_TOKEN.fullmatch(word.text) and word.right <= left + 2
+                       and left - word.right <= 2 * word.height]
+            if not killers:
+                continue
+            killer = max(killers, key=lambda word: word.right)
+            anchor = (killer.right, killer.right + WEAPON_SEARCH_HEIGHTS * killer.height,
+                      killer.middle, killer.height)
         start, end, middle, row_height = anchor
         if not (start - 2 <= left < right <= end + 2
                 and abs((top + bottom) / 2 - middle) <= .75 * row_height):
@@ -712,35 +719,49 @@ def make_weapon_reference(frame, rows, bounds, label, mode):
             box = ((left - (start + end) / 2) / row_height, (top - middle) / row_height,
                    width / row_height, height / row_height)
             return WeaponReference(label.strip(), mode, box, pixels)
-    raise ValueError("Select a clear weapon icon between two readable names on one kill-feed row.")
+    raise ValueError("Select a clear weapon icon just after a readable name on one kill-feed row.")
 
 
-def recognize_weapon(frame, row, references, mode):
-    anchor = weapon_anchor(row)
+def killer_anchor(row, killer):
+    """Search span for the weapon icon after the killer's name, even when the victim is unreadable."""
+    following = [word for word in row.words if word.left >= killer.right + killer.height
+                 and NAME_TOKEN.fullmatch(word.text) and word.confidence >= 40]
+    stop = following[0].left if following else killer.right + WEAPON_SEARCH_HEIGHTS * killer.height
+    return killer.right, stop, killer.middle, killer.height
+
+
+def recognize_weapon(frame, row, references, mode, killer=None):
+    """Return the label of the saved weapon icon found on the row, if exactly one matches well.
+
+    Each icon is searched for across the gap after the killer's name, so it is found
+    wherever the feed places it and without needing the victim's name.
+    """
+    anchor = killer_anchor(row, killer) if killer is not None else weapon_anchor(row)
     if anchor is None:
-        return None
+        names = [word for word in row.words if NAME_TOKEN.fullmatch(word.text)]
+        if not names:
+            return None
+        anchor = killer_anchor(row, names[0])
     start, end, middle, height = anchor
     scores = []
     for reference in references:
         if reference.mode != mode:
             continue
         template = normalize_ocr_patch(reference.pixels)
-        x, y, width, box_height = (round(value * height) for value in reference.box)
+        _, y, width, box_height = (round(value * height) for value in reference.box)
         if not template or width < 2 or box_height < 2:
             continue
-        x += round((start + end) / 2)
         y += round(middle)
         step = max(1, height // 6)
         best = 0
-        for dx in (0, -step, step, -2 * step, 2 * step):
-            if x + dx < start - 2 or x + dx + width > end + 2:
-                continue
+        for x in range(round(start) - 2, round(end) + 3 - width, step):
             for dy in (0, -step, step):
-                patch = normalize_ocr_patch(sample_ocr_patch(frame, x + dx, y + dy, width, box_height))
+                patch = normalize_ocr_patch(sample_ocr_patch(frame, x, y + dy, width, box_height))
                 best = max(best, sum(a * b for a, b in zip(template, patch)))
         scores.append((best, reference.label))
     scores.sort(reverse=True)
-    if scores and scores[0][0] >= .90 and (len(scores) == 1 or scores[0][0] - scores[1][0] >= .04):
+    if (scores and scores[0][0] >= WEAPON_MATCH
+            and (len(scores) == 1 or scores[0][0] - scores[1][0] >= .04 or scores[0][1] == scores[1][1])):
         return scores[0][1]
     return None
 
@@ -943,6 +964,13 @@ def kill_badge_match(frame, rows, reference=None):
 
 
 KILL_ID_SEPARATOR = "\x00"
+# How far after the killer's name to look for a weapon icon, in text heights.
+WEAPON_SEARCH_HEIGHTS = 8
+# Normalised correlation a saved weapon icon needs. BF6 rocket icons score 0.85-0.95 on
+# their clearest frame, while rifles, SMGs and grenades stay below 0.5.
+WEAPON_MATCH = .8
+# Half-second samples after a kill to keep looking for its weapon icon.
+WEAPON_SEARCH_SAMPLES = 10
 KILL_COUNT_PREFIX = "Kills: "
 
 
@@ -1071,8 +1099,22 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
         divider = (feed_divider_x(recording.frame_size, feed.region, feed.divider)
                    if feed and feed.divider is not None else None)
         kills = KillTracker()
+        # [kill sample, label or None] for kills whose weapon icon is still being looked for.
+        weapon_searches = []
+        weapon_events = []
 
-        def feed_matches(rows, _frame):
+        def find_weapons(frame, killers):
+            for search in weapon_searches:
+                if search[1] is None:
+                    for row, word in killers:
+                        search[1] = recognize_weapon(frame, row, feed.weapon_references, feed.mode, killer=word)
+                        if search[1]:
+                            weapon_events.append((search[0] / 2, f"Weapon: {search[1]}"))
+                            break
+            weapon_searches[:] = [search for search in weapon_searches
+                                  if search[1] is None and kills.sample - search[0] < WEAPON_SEARCH_SAMPLES]
+
+        def feed_matches(rows, frame):
             if feed:
                 rows = position_feed_rows(rows, divider)
             lines = {row.text.casefold() for row in rows}
@@ -1083,6 +1125,8 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
             lookalikes = set()
             lookalike_rows = set()
             killer_rows = []
+            killers = []
+            counted = []
             if feed:
                 for row in rows:
                     for spelling, side, green, word in row.name_words(feed_pattern):
@@ -1093,7 +1137,12 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                         green_name |= green
                         if (side == "left" or not killer_only) and (green or not green_only):
                             matches.add(row.text.casefold())
-                            killer_rows.append((row.text.casefold(), word.middle))
+                            # OCR sometimes repeats a name within one line; count each line once.
+                            if not any(seen is row for seen in counted):
+                                counted.append(row)
+                                killer_rows.append((row.text.casefold(), word.middle))
+                            if side == "left":
+                                killers.append((row, word))
             else:
                 matches = mentions
             if diagnostics is not None:
@@ -1114,30 +1163,24 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                         diagnostics.feed_rows[line] += 1
             if not feed:
                 return matches
-            return kills.update(killer_rows)
+            new = kills.update(killer_rows)
+            if feed.weapon_references:
+                weapon_searches.extend([kills.sample, None] for _ in new)
+                if weapon_searches:
+                    # The icon is often clearest a second or two after the line appears.
+                    find_weapons(frame, killers)
+            return new
 
-        def describe_feed(rows, frame, new_matches, _timestamp):
+        def describe_feed(_rows, _frame, new_matches, _timestamp):
             if len(new_matches) > 1:
                 yield f"{KILL_COUNT_PREFIX}{len(new_matches)}"
-            if feed.weapon_references:
-                yield from describe_weapons(rows, frame, new_matches)
-
-        def describe_weapons(rows, frame, new_matches):
-            new_lines = {match.split(KILL_ID_SEPARATOR)[0] for match in new_matches}
-            for row in position_feed_rows(rows, divider):
-                if row.text.casefold() not in new_lines:
-                    continue
-                if any(side == "left" and (marked_green or not green_only)
-                       for _, side, marked_green in row.name_sides(feed_pattern)):
-                    weapon = recognize_weapon(frame, row, feed.weapon_references, feed.mode)
-                    if weapon:
-                        yield f"Weapon: {weapon}"
 
         events.extend(ocr_events(path, feed.region if feed else FEED, "Kill feed", feed_matches,
                                  recording.duration, progress, page_mode="6" if feed else "11",
                                  stop=stop, mode=feed.mode if feed else OCR_MODES[0],
                                  hardware_decode=acceleration.decode,
                                  describe=describe_feed if feed else None))
+        events.extend(weapon_events)
     if badge:
         if diagnostics is not None:
             diagnostics.badge_samples = 0
@@ -2074,12 +2117,83 @@ def styled_montage(segments, staging, output, output_format, mic_mix_track, styl
     return destination
 
 
+def settings_path():
+    """Where the desktop app keeps its settings, including saved weapon icons."""
+    if os.name == "nt":
+        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
+        return base / "QuickClip" / "settings.json"
+    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return base / "quickclip" / "settings.json"
+
+
+def load_weapon_references(path):
+    try:
+        values = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return ()
+    references = []
+    for item in values.get("weapon_references", ()) if isinstance(values, dict) else ():
+        try:
+            references.append(WeaponReference(item["label"], item["mode"], tuple(item["box"]), tuple(item["pixels"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return tuple(references)
+
+
+PRESETS = Path(__file__).resolve().with_name("presets")
+
+
+def load_presets():
+    """Built-in game presets: feed area, OCR treatment, montage cue and weapon icons."""
+    presets = {}
+    for path in sorted(PRESETS.glob("*.json")):
+        try:
+            values = json.loads(path.read_text(encoding="utf-8"))
+            references = tuple(WeaponReference(item["label"], item["mode"], tuple(item["box"]), tuple(item["pixels"]))
+                               for item in values.get("weapon_references", ()))
+            parse_feed_region(values["feed_region"])
+            if values["feed_mode"] not in OCR_MODES:
+                continue
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        presets[path.stem] = {**values, "weapon_references": references}
+    return presets
+
+
+def merge_weapon_references(saved, extra):
+    """Add extra icons, keeping a saved icon with the same label and treatment instead."""
+    have = {(reference.label.casefold(), reference.mode) for reference in saved}
+    return tuple(saved) + tuple(reference for reference in extra if (reference.label.casefold(), reference.mode) not in have)
+
+
+def parse_weapon_filter(text):
+    """Comma-separated weapon labels, compared without regard to case."""
+    return frozenset(label.strip().casefold() for label in text.split(",") if label.strip())
+
+
+def clip_weapons(clip):
+    return {reason.removeprefix("Weapon: ").casefold() for reason in clip.reasons if reason.startswith("Weapon: ")}
+
+
+def matches_weapons(clip, wanted):
+    return not wanted or bool(clip_weapons(clip) & wanted)
+
+
+def only_weapons(candidates, wanted):
+    """Keep only clips with one of the wanted weapons."""
+    for result in candidates:
+        if wanted:
+            result.clips = [clip for clip in result.clips if matches_weapons(clip, wanted)]
+        yield result
+
+
 def kill_montage(sources, player, before, after, output, progress=print, *,
                  audio_offset_ms=0, workers=DEFAULT_MONTAGE_WORKERS, feed=KillFeedOptions(),
-                 acceleration=VideoAcceleration(), output_format="mkv", mic_mix_track=None, style=None):
+                 acceleration=VideoAcceleration(), output_format="mkv", mic_mix_track=None, style=None,
+                 weapons=frozenset()):
     with closing(scan_kills(sources, player, before, after, progress, workers=workers,
                             feed=feed, acceleration=acceleration)) as candidates:
-        return write_montage(sources, candidates, output, progress, audio_offset_ms=audio_offset_ms,
+        return write_montage(sources, only_weapons(candidates, weapons), output, progress, audio_offset_ms=audio_offset_ms,
                              acceleration=acceleration, output_format=output_format, mic_mix_track=mic_mix_track,
                              style=style)
 
@@ -2123,17 +2237,23 @@ def main():
                         help="Play multi-kills at half speed in the montage.")
     parser.add_argument("--mic-at-kills", action="store_true",
                         help="With --mix-mic-track, mix the mic in only around each kill.")
+    parser.add_argument("--settings", type=Path, metavar="FILE",
+                        help="Desktop settings file to read saved weapon icons from (default: the app's own).")
+    parser.add_argument("--only-weapon", action="append", default=[], metavar="LABEL",
+                        help="Montage only kills with this saved weapon label, such as Rocket. Repeat for more.")
     parser.add_argument("--kill-badge", action="store_true",
                         help="Detect Battlefield's on-screen KILL label in montage mode. Omit --player for badge only.")
     parser.add_argument("--badge-feed-details", action="store_true",
                         help="Scan for kill badges, then read the kill feed around each hit in montage mode.")
     parser.add_argument("--workers", type=int, default=DEFAULT_MONTAGE_WORKERS,
                         help=f"Recordings to scan at once in montage mode (default {DEFAULT_MONTAGE_WORKERS}).")
-    parser.add_argument("--feed-region", default="58,0,42,30", metavar="L,T,W,H",
+    parser.add_argument("--preset", choices=sorted(load_presets()),
+                        help="Game preset for the kill-feed area, text treatment and weapon icons, such as battlefield6.")
+    parser.add_argument("--feed-region", metavar="L,T,W,H",
                         help="Montage kill-feed crop as percentages of the full frame.")
     parser.add_argument("--feed-divider", metavar="PERCENT",
                         help="Use a fixed split measured from the left edge of the crop. Defaults to per-row detection.")
-    parser.add_argument("--feed-text-mode", choices=OCR_MODE_ARGS, default="grayscale",
+    parser.add_argument("--feed-text-mode", choices=OCR_MODE_ARGS,
                         help="Image treatment used on the montage kill-feed crop.")
     parser.add_argument("--any-feed-mention", action="store_true",
                         help="Include any OCR line mentioning the player in a montage, including deaths.")
@@ -2148,6 +2268,12 @@ def main():
     parser.add_argument("--radeon-decode", action="store_true",
                         help="Try Radeon D3D11VA decoding for OCR and exports on Windows.")
     args = parser.parse_args()
+    preset = load_presets()[args.preset] if args.preset else {}
+    if args.feed_region is None:
+        args.feed_region = preset.get("feed_region", "58,0,42,30")
+    if args.feed_text_mode is None:
+        args.feed_text_mode = next((key for key, mode in OCR_MODE_ARGS.items() if mode == preset.get("feed_mode")),
+                                   "grayscale")
     is_folder = args.recording is not None and args.recording.is_dir()
     if args.files is not None and (args.files < 1 or not is_folder):
         parser.error("--files requires a folder and a positive whole number.")
@@ -2189,12 +2315,23 @@ def main():
                                    fallback_track, args.threshold,
                                    OCR_MODE_ARGS[args.feed_text_mode],
                                    parse_feed_divider(args.feed_divider) if args.feed_divider is not None else None,
-                                   badge=badge, badge_feed_details=args.badge_feed_details)
+                                   badge=badge, badge_feed_details=args.badge_feed_details,
+                                   weapon_references=merge_weapon_references(
+                                       load_weapon_references(args.settings or settings_path()),
+                                       preset.get("weapon_references", ())))
+            if args.only_weapon:
+                labels = {reference.label.casefold() for reference in feed.weapon_references
+                          if reference.mode == feed.mode}
+                missing = parse_weapon_filter(",".join(args.only_weapon)) - labels
+                if missing:
+                    raise ValueError(f"No saved {feed.mode} weapon icon is labelled {', '.join(sorted(missing))}. "
+                                     "Save one in Test feed OCR, or pass --settings.")
             results, montage = kill_montage(sources, args.player, before, after, args.output,
                                             audio_offset_ms=args.audio_offset_ms, workers=args.workers,
                                             feed=feed, acceleration=acceleration,
                                             output_format=args.montage_format or "mkv",
-                                            mic_mix_track=args.mix_mic_track, style=style)
+                                            mic_mix_track=args.mix_mic_track, style=style,
+                                            weapons=parse_weapon_filter(",".join(args.only_weapon)))
             for result in results:
                 if args.show_feed and result.badge_samples is not None:
                     print(f"{result.source.name}: KILL badge seen in {result.badge_samples} sample(s).")
