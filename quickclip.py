@@ -498,7 +498,10 @@ def player_name_pattern(player, allow_lookalikes=False):
 
 def ocr_filter(region, mode):
     width, height, left, top = region
-    filters = (f"crop=iw*{width}:ih*{height}:iw*{left}:ih*{top}:exact=1,"
+    # Convert to 8 bits before scaling. Scaling full-range 10-bit video (such as HDR game
+    # captures) straight to gray garbles letter edges in FFmpeg 8, which defeats OCR.
+    convert = "format=gray" if mode in (OCR_MODES[0], OCR_MODES[1], LOCAL_CONTRAST) else "format=yuv444p"
+    filters = (f"crop=iw*{width}:ih*{height}:iw*{left}:ih*{top}:exact=1,{convert},"
                f"scale={OCR_WIDTH}:{OCR_HEIGHT}:force_original_aspect_ratio=decrease:flags=lanczos")
     pad = f"pad={OCR_WIDTH}:{OCR_HEIGHT}:(ow-iw)/2:(oh-ih)/2"
     if mode == FAINT_TEXT:
