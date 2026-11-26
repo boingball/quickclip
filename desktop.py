@@ -24,7 +24,7 @@ from quickclip import (
     resume_montage_job, run, save_montage_job, scan_kills, skull_search_area, skull_search_preview,
     WeaponReference, clip_preview_frames, filter_recording_dates, make_weapon_reference, recognize_weapon,
     recording_date, MontageStyle, TRANSITIONS, VERTICAL_MODES, matches_weapons, parse_weapon_filter, settings_path,
-    load_presets, merge_weapon_references, preview_command,
+    load_presets, merge_weapon_references, preview_command, kill_children,
 )
 from scan_review import SavedScan
 
@@ -298,6 +298,7 @@ class Desktop:
         self.export_button.pack(side="right")
         self.build_button = ttk.Button(actions, text="Build montage", command=self.build_montage)
         self.pause_button = ttk.Button(actions, text="Pause montage", command=self.pause_montage)
+        self.stop_scan_button = ttk.Button(actions, text="Stop scan", command=self.stop_scan)
         self.cancel_shutdown_button = ttk.Button(actions, text="Cancel shutdown", command=self.cancel_shutdown)
         self.keep_label = ttk.Label(actions, textvariable=self.keep_count)
         self.keep_label.pack(side="left", padx=10)
@@ -413,15 +414,42 @@ class Desktop:
                 self.settings_warning_shown = True
                 messagebox.showwarning("QuickClip", f"Could not save settings. {error}")
 
+    def stop_scan(self):
+        if self.montage_scanning and self.scan_stop is not None:
+            self.scan_stop.set()
+            self.status.set("Stopping the scan… Finished replays are saved; Resume replay scan carries on later.")
+            self.buttons()
+
+    def force_quit(self):
+        """Quit at once: stop FFmpeg and Tesseract instead of waiting for them to finish."""
+        if self.scan_stop is not None:
+            self.scan_stop.set()
+        if self.montage_pause is not None:
+            self.montage_pause.set()
+        self.stop_feed_playback()
+        try:
+            self.save_settings()
+        except Exception:
+            pass
+        kill_children()
+        self.root.destroy()
+        # Worker threads may still be inside a stopped process; leave without waiting for them.
+        os._exit(0)
+
     def close(self):
+        if self.close_after_montage:
+            # Close pressed again while waiting: stop everything now.
+            self.force_quit()
+            return
         if self.montage_pause is not None:
             self.close_after_montage = True
             self.pause_montage()
+            self.status.set("Pausing the montage and closing… Close again to quit now.")
             return
         if self.montage_scanning and self.scan_stop is not None:
             self.close_after_montage = True
             self.scan_stop.set()
-            self.status.set("Saving replay scan and closing…")
+            self.status.set("Saving replay scan and closing… Close again to quit now.")
             return
         self.cancel_shutdown(quiet=True)
         self.stop_feed_playback()
@@ -462,6 +490,11 @@ class Desktop:
             self.pause_button.configure(state="disabled" if self.montage_pause.is_set() else "normal")
         else:
             self.pause_button.pack_forget()
+        if self.montage_scanning and self.scan_stop is not None:
+            self.stop_scan_button.pack(side="right", padx=(0, 6), before=self.keep_label)
+            self.stop_scan_button.configure(state="disabled" if self.scan_stop.is_set() else "normal")
+        else:
+            self.stop_scan_button.pack_forget()
         self.preview_button.configure(state="normal" if can_preview and shutil.which("ffplay") else "disabled")
 
     def work(self, operation, complete):
@@ -511,6 +544,8 @@ class Desktop:
                     self.scan_stop = None
                     self.update_keep_count()
                 if self.close_after_montage:
+                    # The scan or montage has stopped; close normally now.
+                    self.close_after_montage = False
                     self.close()
                     return
                 if kind == "paused":
@@ -1576,7 +1611,9 @@ class Desktop:
             try:
                 decode = radeon and resolve_video_acceleration(VideoAcceleration(False, True), lambda _: None).decode
                 feeder = subprocess.Popen(preview_command(source, clip.start, clip.end - clip.start, decode),
-                                          stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+                                          stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                          # Closing FFplay early breaks the pipe; that is not an error.
+                                          stderr=subprocess.DEVNULL)
                 subprocess.Popen([player, "-loglevel", "error", "-autoexit", "-window_title",
                                   f"{Path(source).name} {clock(clip.start)}", "-"],
                                  stdin=feeder.stdout)
