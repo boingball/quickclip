@@ -23,7 +23,8 @@ from quickclip import (
     make_skull_reference, preview_feed, preview_kill_badge, probe, process_batch, resolve_video_acceleration,
     resume_montage_job, run, save_montage_job, scan_kills, skull_search_area, skull_search_preview,
     WeaponReference, clip_preview_frames, filter_recording_dates, make_weapon_reference, recognize_weapon,
-    recording_date, MontageStyle, TRANSITIONS, VERTICAL_MODES,
+    recording_date, MontageStyle, TRANSITIONS, VERTICAL_MODES, matches_weapons, parse_weapon_filter, settings_path,
+    load_presets, merge_weapon_references,
 )
 from scan_review import SavedScan
 
@@ -34,14 +35,6 @@ def clock(seconds):
     minutes, remainder = divmod(seconds, 60)
     hours, minutes = divmod(int(minutes), 60)
     return f"{hours:02}:{minutes:02}:{remainder:05.2f}"
-
-
-def settings_path():
-    if os.name == "nt":
-        base = Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming")
-        return base / "QuickClip" / "settings.json"
-    base = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
-    return base / "quickclip" / "settings.json"
 
 
 class FeedPlayback:
@@ -172,6 +165,7 @@ class Desktop:
         self.montage_transition.current(0)
         self.montage_vertical = ttk.Combobox(settings, state="readonly", values=VERTICAL_MODES, width=18)
         self.montage_vertical.current(0)
+        self.only_weapons = ttk.Entry(settings, width=18)
         for field, value in ((self.threshold, "-18"), (self.before, "10"), (self.after, "6")):
             field.insert(0, value)
         settings_fields = (
@@ -188,6 +182,7 @@ class Desktop:
             ("Mix mic track (optional)", self.mic_mix_track, 8, 2),
             ("Montage transition", self.montage_transition, 9, 0),
             ("Vertical for TikTok", self.montage_vertical, 9, 2),
+            ("Only weapons (e.g. Rocket)", self.only_weapons, 11, 0),
         )
         for label, field, row, column in settings_fields:
             ttk.Label(settings, text=label).grid(row=row, column=column, sticky="w", padx=(0, 8))
@@ -206,6 +201,16 @@ class Desktop:
             row=7, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(settings, text="Radeon hardware decoding", variable=self.radeon_decode).grid(
             row=6, column=2, columnspan=2, sticky="w")
+        self.presets = load_presets()
+        if self.presets:
+            preset_row = ttk.Frame(settings)
+            preset_row.grid(row=11, column=2, columnspan=2, sticky="w")
+            ttk.Label(preset_row, text="Game preset").pack(side="left", padx=(0, 8))
+            self.preset_choice = ttk.Combobox(preset_row, state="readonly", width=16,
+                                              values=[preset["name"] for preset in self.presets.values()])
+            self.preset_choice.current(0)
+            self.preset_choice.pack(side="left")
+            ttk.Button(preset_row, text="Apply", command=self.apply_preset).pack(side="left", padx=6)
         ttk.Checkbutton(settings, text="Slow motion on multi-kills", variable=self.slowmo_multikills).grid(
             row=10, column=0, columnspan=2, sticky="w")
         ttk.Checkbutton(settings, text="Mic only around kills", variable=self.mic_at_kills).grid(
@@ -317,6 +322,7 @@ class Desktop:
             "montage_limit": self.montage_limit,
             "montage_workers": self.montage_workers,
             "mic_mix_track": self.mic_mix_track,
+            "only_weapons": self.only_weapons,
         }
 
     def load_settings(self):
@@ -1418,7 +1424,8 @@ class Desktop:
         for position, clip in enumerate(result.clips):
             index = len(self.clips)
             self.clips.append((result.source, clip))
-            keep = self.montage_review and position not in rejected
+            keep = (self.montage_review and position not in rejected
+                    and matches_weapons(clip, parse_weapon_filter(self.only_weapons.get())))
             if keep:
                 self.kept.add(index)
             tracks = result.audio_tracks
@@ -1432,6 +1439,18 @@ class Desktop:
         if self.montage_review and first == 0 and self.clips:
             self.table.selection_set("0")
             self.table.focus("0")
+
+    def apply_preset(self):
+        preset = next(preset for preset in self.presets.values() if preset["name"] == self.preset_choice.get())
+        self.feed_region.set(preset["feed_region"])
+        self.feed_mode.set(preset["feed_mode"])
+        if preset.get("montage_cue") in MONTAGE_CUES:
+            self.montage_cue.set(preset["montage_cue"])
+        self.weapon_references = merge_weapon_references(self.weapon_references, preset["weapon_references"])
+        self.save_settings()
+        labels = ", ".join(reference.label for reference in preset["weapon_references"])
+        self.status.set(f"Applied the {preset['name']} preset: kill-feed area, {preset['feed_mode']} text"
+                        + (f", and weapon icons ({labels})." if labels else "."))
 
     def build_montage(self):
         try:
