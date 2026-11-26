@@ -24,7 +24,7 @@ from quickclip import (
     resume_montage_job, run, save_montage_job, scan_kills, skull_search_area, skull_search_preview,
     WeaponReference, clip_preview_frames, filter_recording_dates, make_weapon_reference, recognize_weapon,
     recording_date, MontageStyle, TRANSITIONS, VERTICAL_MODES, matches_weapons, parse_weapon_filter, settings_path,
-    load_presets, merge_weapon_references, preview_command,
+    load_presets, merge_weapon_references, preview_command, kill_children,
 )
 from scan_review import SavedScan
 
@@ -97,7 +97,7 @@ class Desktop:
         self.messages = Queue()
         self.status = tk.StringVar(value="Open an OBS recording or folder to get started.")
         self.filename = tk.StringVar(value="No input selected")
-        self.output_name = tk.StringVar(value="No output folder selected")
+        self.output_name = tk.StringVar(value="")
         self.from_date = tk.StringVar()
         self.to_date = tk.StringVar()
         self.date_range_label = tk.StringVar(value="No recording dates available")
@@ -137,7 +137,11 @@ class Desktop:
         output_row.pack(fill="x", pady=(8, 0))
         self.output_button = ttk.Button(output_row, text="Output folder…", command=self.choose_output)
         self.output_button.pack(side="left")
-        ttk.Label(output_row, textvariable=self.output_name).pack(side="left", padx=10)
+        # Type or paste a folder here, or use the button to browse.
+        self.output_entry = ttk.Entry(output_row, textvariable=self.output_name, width=70)
+        self.output_entry.pack(side="left", padx=10, fill="x", expand=True)
+        self.output_entry.bind("<Return>", self.type_output)
+        self.output_entry.bind("<FocusOut>", self.type_output)
         date_row = ttk.Frame(body)
         date_row.pack(fill="x", pady=(8, 0))
         self.date_button = ttk.Button(date_row, text="Pick dates…", command=self.choose_dates)
@@ -298,6 +302,7 @@ class Desktop:
         self.export_button.pack(side="right")
         self.build_button = ttk.Button(actions, text="Build montage", command=self.build_montage)
         self.pause_button = ttk.Button(actions, text="Pause montage", command=self.pause_montage)
+        self.stop_scan_button = ttk.Button(actions, text="Stop scan", command=self.stop_scan)
         self.cancel_shutdown_button = ttk.Button(actions, text="Cancel shutdown", command=self.cancel_shutdown)
         self.keep_label = ttk.Label(actions, textvariable=self.keep_count)
         self.keep_label.pack(side="left", padx=10)
@@ -413,15 +418,42 @@ class Desktop:
                 self.settings_warning_shown = True
                 messagebox.showwarning("QuickClip", f"Could not save settings. {error}")
 
+    def stop_scan(self):
+        if self.montage_scanning and self.scan_stop is not None:
+            self.scan_stop.set()
+            self.status.set("Stopping the scan… Finished replays are saved; Resume replay scan carries on later.")
+            self.buttons()
+
+    def force_quit(self):
+        """Quit at once: stop FFmpeg and Tesseract instead of waiting for them to finish."""
+        if self.scan_stop is not None:
+            self.scan_stop.set()
+        if self.montage_pause is not None:
+            self.montage_pause.set()
+        self.stop_feed_playback()
+        try:
+            self.save_settings()
+        except Exception:
+            pass
+        kill_children()
+        self.root.destroy()
+        # Worker threads may still be inside a stopped process; leave without waiting for them.
+        os._exit(0)
+
     def close(self):
+        if self.close_after_montage:
+            # Close pressed again while waiting: stop everything now.
+            self.force_quit()
+            return
         if self.montage_pause is not None:
             self.close_after_montage = True
             self.pause_montage()
+            self.status.set("Pausing the montage and closing… Close again to quit now.")
             return
         if self.montage_scanning and self.scan_stop is not None:
             self.close_after_montage = True
             self.scan_stop.set()
-            self.status.set("Saving replay scan and closing…")
+            self.status.set("Saving replay scan and closing… Close again to quit now.")
             return
         self.cancel_shutdown(quiet=True)
         self.stop_feed_playback()
@@ -441,7 +473,7 @@ class Desktop:
     def buttons(self):
         ready = bool(self.table.selection()) and not self.busy
         can_preview = bool(self.table.selection()) and (not self.busy or self.montage_scanning)
-        for button in (self.open_button, self.folder_button, self.output_button):
+        for button in (self.open_button, self.folder_button, self.output_button, self.output_entry):
             button.configure(state="disabled" if self.busy else "normal")
         self.date_button.configure(state="normal" if self.recording_dates and not self.busy else "disabled")
         for button in (self.scan_button, self.batch_button, self.montage_button, self.crop_button):
@@ -462,6 +494,11 @@ class Desktop:
             self.pause_button.configure(state="disabled" if self.montage_pause.is_set() else "normal")
         else:
             self.pause_button.pack_forget()
+        if self.montage_scanning and self.scan_stop is not None:
+            self.stop_scan_button.pack(side="right", padx=(0, 6), before=self.keep_label)
+            self.stop_scan_button.configure(state="disabled" if self.scan_stop.is_set() else "normal")
+        else:
+            self.stop_scan_button.pack_forget()
         self.preview_button.configure(state="normal" if can_preview and shutil.which("ffplay") else "disabled")
 
     def work(self, operation, complete):
@@ -511,6 +548,8 @@ class Desktop:
                     self.scan_stop = None
                     self.update_keep_count()
                 if self.close_after_montage:
+                    # The scan or montage has stopped; close normally now.
+                    self.close_after_montage = False
                     self.close()
                     return
                 if kind == "paused":
@@ -742,10 +781,28 @@ class Desktop:
 
     def show_output(self):
         directory = self.output or self.default_output
-        self.output_name.set(str(directory) if directory else "No output folder selected")
+        self.output_name.set(str(directory) if directory else "")
+
+    def type_output(self, _event=None):
+        text = self.output_name.get().strip().strip('"')
+        current = self.output or self.default_output
+        if not text:
+            self.show_output()
+            return
+        if current is not None and Path(text) == current:
+            return
+        self.output = Path(text)
+        self.show_output()
+        self.save_settings()
+        self.buttons()
 
     def choose_output(self):
-        directory = filedialog.askdirectory(mustexist=False)
+        # Open the browser in the current output folder, or the nearest folder that exists.
+        start = self.output or self.default_output
+        while start is not None and not start.is_dir() and start.parent != start:
+            start = start.parent
+        options = {"initialdir": str(start)} if start is not None and start.is_dir() else {}
+        directory = filedialog.askdirectory(mustexist=False, **options)
         if directory:
             self.output = Path(directory)
             self.show_output()
@@ -1576,7 +1633,9 @@ class Desktop:
             try:
                 decode = radeon and resolve_video_acceleration(VideoAcceleration(False, True), lambda _: None).decode
                 feeder = subprocess.Popen(preview_command(source, clip.start, clip.end - clip.start, decode),
-                                          stdout=subprocess.PIPE, stdin=subprocess.DEVNULL)
+                                          stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                          # Closing FFplay early breaks the pipe; that is not an error.
+                                          stderr=subprocess.DEVNULL)
                 subprocess.Popen([player, "-loglevel", "error", "-autoexit", "-window_title",
                                   f"{Path(source).name} {clock(clip.start)}", "-"],
                                  stdin=feeder.stdout)

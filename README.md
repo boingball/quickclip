@@ -43,6 +43,8 @@ If the score is readable and the skull is visible but the test finds no match, d
 
 1. Open a recording or folder, enter your in-game name, and set the seconds before and after each kill. Set **Montage file limit** to `5` for a short trial, or leave it blank to scan the whole folder.
 2. Click **Find montage clips**. QuickClip runs Tesseract only on the kill-feed crop. It looks for the gap between names separately in each row and counts your name on the killer side. It merges overlapping moments from the same recording. Up to four recordings scan concurrently by default, and results appear as each file finishes. Adjust **Montage scan workers** to change how many run at once.
+While a montage scan runs, **Stop scan** stops it after the current frames. Finished replays are kept, and **Resume replay scan** picks up the rest later. Closing the window during a scan saves it first; close again to quit at once, which stops every FFmpeg and Tesseract process QuickClip started.
+
 3. Select a row and click **Play clip** to preview it in FFplay. FFmpeg first shrinks the clip to 720p and converts HDR to normal colours, using the Radeon decoder when **Radeon hardware decoding** is on, so 4K replays fit on screen and play smoothly. Click its **Keep** checkbox or press **Space** on the focused row to toggle it. All candidates are checked initially.
 4. Choose the output folder and set **Montage format** to MKV or MP4. Click **Build montage** to join the checked clips in filename order.
 

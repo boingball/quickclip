@@ -21,7 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-from threading import Event
+from threading import Event, Lock
 
 
 @dataclass(frozen=True)
@@ -82,12 +82,43 @@ class MontagePaused(Exception):
     pass
 
 
-def run(command, **kwargs):
-    result = subprocess.run(command, capture_output=True, **BACKGROUND, **kwargs)
-    if result.returncode:
-        raise RuntimeError(result.stderr.decode(errors="replace").strip() or
-                           f"{command[0]} exited with status {result.returncode}")
-    return result.stdout
+# Running FFmpeg and Tesseract processes, so quitting can stop them all at once.
+_children = set()
+_children_lock = Lock()
+
+
+@contextmanager
+def tracked(process):
+    with _children_lock:
+        _children.add(process)
+    try:
+        yield process
+    finally:
+        with _children_lock:
+            _children.discard(process)
+
+
+def kill_children():
+    """Stop every FFmpeg and Tesseract process QuickClip started."""
+    with _children_lock:
+        processes = list(_children)
+    for process in processes:
+        if process.poll() is None:
+            try:
+                process.kill()
+            except OSError:
+                pass
+
+
+def run(command, input=None, **kwargs):
+    stdin = subprocess.PIPE if input is not None else subprocess.DEVNULL
+    with subprocess.Popen(command, stdin=stdin, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                          **BACKGROUND, **kwargs) as process, tracked(process):
+        stdout, stderr = process.communicate(input)
+    if process.returncode:
+        raise RuntimeError(stderr.decode(errors="replace").strip() or
+                           f"{command[0]} exited with status {process.returncode}")
+    return stdout
 
 
 def run_export(command, description, progress, duration=None):
@@ -95,7 +126,7 @@ def run_export(command, description, progress, duration=None):
     command = command[:1] + ["-nostats", "-stats_period", "1", "-progress", "pipe:1"] + command[1:]
     with tempfile.TemporaryFile() as errors:
         with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, encoding="utf-8",
-                              errors="replace", **BACKGROUND) as process:
+                              errors="replace", **BACKGROUND) as process, tracked(process):
             stats = {}
             seconds = 0.0
             try:
@@ -195,7 +226,8 @@ def probe(path):
 def blocks(command, size):
     """Read fixed-size chunks while keeping FFmpeg's diagnostics off the data pipe."""
     with tempfile.TemporaryFile() as errors:
-        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, **BACKGROUND) as process:
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, **BACKGROUND) as process, \
+                tracked(process):
             try:
                 while data := process.stdout.read(size):
                     yield data
