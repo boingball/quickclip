@@ -7,6 +7,7 @@ from contextlib import closing, contextmanager, nullcontext
 import csv
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
+from difflib import SequenceMatcher
 from functools import lru_cache
 import hashlib
 from itertools import islice
@@ -231,6 +232,34 @@ def decode(path, *input_options):
             "-copyts", "-start_at_zero", *input_options, "-i", str(path)]
 
 
+PREVIEW_HEIGHT = 720
+HDR_TRANSFERS = ("arib-std-b67", "smpte2084")
+
+
+def preview_command(path, start, duration, hardware_decode=False):
+    """FFmpeg command that streams a 720p SDR copy of part of a recording for FFplay.
+
+    FFplay alone opens 4K captures at full size and cannot use the Radeon decoder, so a 4K
+    AV1 replay can overflow the screen or stall. FFmpeg decodes (on the GPU when asked; it
+    falls back to the CPU by itself), shrinks the picture and converts HDR to SDR first.
+    """
+    try:
+        transfer = run(["ffprobe", "-v", "error", "-select_streams", "V:0", "-show_entries",
+                        "stream=color_transfer", "-of", "csv=p=0", str(path)]).decode().strip()
+    except (OSError, RuntimeError):
+        transfer = ""
+    picture = f"scale=-2:'min({PREVIEW_HEIGHT},ih)':flags=bicubic"
+    if transfer in HDR_TRANSFERS and "zscale" in ffmpeg_features("ffmpeg", "-filters"):
+        picture += (",zscale=t=linear:npl=203,format=gbrpf32le,zscale=p=bt709,tonemap=hable:desat=0,"
+                    "zscale=t=bt709:m=bt709:r=tv")
+    picture += ",format=yuv420p"
+    hardware = ["-hwaccel", "d3d11va"] if hardware_decode else []
+    return ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", *hardware,
+            "-ss", f"{start:.3f}", "-t", f"{duration:.3f}", "-i", str(path),
+            "-map", "0:V:0", "-map", "0:a:0?", "-vf", picture,
+            "-c:v", "rawvideo", "-c:a", "pcm_s16le", "-ac", "2", "-f", "nut", "pipe:1"]
+
+
 def audio_levels(path, track):
     # Measure RMS in 100 ms windows, after aligning audio to the recording clock.
     command = decode(path) + ["-map", f"0:a:{track - 1}", "-vn", "-ac", "1",
@@ -307,6 +336,12 @@ OCR_PATCH_SIZE = 12
 OCR_MODE_ARGS = dict(zip(("grayscale", "bright", "colored", "green", "faint", "local"), OCR_MODES))
 # Half-second samples a player's kill-feed line count is remembered, to ride out OCR dropouts.
 FEED_KILL_MEMORY = 6
+# A kill line stays in the feed for about 10 s. Remember readable victims a little longer so
+# a line read again later is not taken for a new kill.
+FEED_VICTIM_MEMORY = 24
+FEED_VICTIM_CONFIDENCE = 30
+# How long a kill reported without a readable victim can still be matched to one.
+FEED_UNNAMED_MEMORY = 12
 OCR_WIDTH, OCR_HEIGHT = 960, 480
 OCR_HEADER = f"P5\n{OCR_WIDTH} {OCR_HEIGHT}\n255\n".encode("ascii")
 OCR_CONFIDENCE = 60
@@ -974,30 +1009,74 @@ WEAPON_SEARCH_SAMPLES = 10
 KILL_COUNT_PREFIX = "Kills: "
 
 
+def feed_victim(row, killer):
+    """The victim's name on a kill line, when OCR read it confidently."""
+    names = [word for word in row.words
+             if word.left >= killer.right + killer.height and NAME_TOKEN.fullmatch(word.text)
+             and word.confidence >= FEED_VICTIM_CONFIDENCE and len(word.text) >= 4]
+    return names[-1].text.casefold() if names else None
+
+
+def same_name(a, b):
+    return SequenceMatcher(None, a, b).ratio() >= .7
+
+
 class KillTracker:
     """Turn per-sample kill-feed matches into one event per kill.
 
     Each kill adds one line with the player's name to the feed, and the line stays up for
     several seconds while OCR reads it a little differently from frame to frame. Count the
-    player's lines and report only a rise above the most seen in the last few seconds, so a
-    line that flickers out of OCR for a moment is not reported again.
+    player's lines and report a rise above the most seen in the last few seconds, so a line
+    that flickers out of OCR for a moment is not reported again.
+
+    A faint feed may be read only one line at a time, so the count alone can miss kills in
+    quick succession. A line whose victim is read clearly for the first time is also a new
+    kill, unless a kill reported shortly before had no readable victim: then it is that one.
     """
 
-    def __init__(self, memory=FEED_KILL_MEMORY):
+    def __init__(self, memory=FEED_KILL_MEMORY, victim_memory=FEED_VICTIM_MEMORY):
         self.counts = deque(maxlen=memory)
+        self.victim_memory = victim_memory
+        self.victims = {}
+        # Samples of reported kills whose victim was not read yet.
+        self.unnamed = deque()
         self.sample = -1
 
     def update(self, lines):
-        """Take (row text, vertical position) pairs; return IDs of the rows that are new kills."""
+        """Take (row text, vertical position[, victim]) tuples; return IDs of the rows that are new kills."""
         self.sample += 1
         recent = max(self.counts, default=0)
         self.counts.append(len(lines))
-        added = len(lines) - recent
+        self.victims = {name: seen for name, seen in self.victims.items()
+                        if self.sample - seen <= self.victim_memory}
+        while self.unnamed and self.sample - self.unnamed[0] > FEED_UNNAMED_MEMORY:
+            self.unnamed.popleft()
+        fresh = []
+        unnamed = []
+        for line in lines:
+            victim = line[2] if len(line) > 2 else None
+            if victim is None:
+                unnamed.append(line)
+                continue
+            known = [name for name in self.victims if same_name(name, victim)]
+            if not known and not any(same_name(victim, other[2]) for other in fresh):
+                if self.unnamed:
+                    # The victim of a kill already reported, read clearly at last.
+                    self.unnamed.popleft()
+                else:
+                    fresh.append(line)
+            for name in known:
+                self.victims[name] = self.sample
+            self.victims[victim] = self.sample
+        # Lines whose victim is already known cannot be new kills.
+        counted = min(len(lines) - recent, len(fresh) + len(unnamed))
+        added = max(counted, len(fresh))
         if added <= 0:
             return set()
-        # Name the lowest lines: the feed adds new lines at the bottom.
-        newest = sorted(lines, key=lambda line: line[1])[-added:]
-        return {f"{text}{KILL_ID_SEPARATOR}{self.sample}.{index}" for index, (text, _) in enumerate(newest)}
+        # Name new victims first, then the lowest unnamed lines: the feed adds new lines at the bottom.
+        newest = (fresh + sorted(unnamed, key=lambda line: line[1])[::-1])[:added]
+        self.unnamed.extend(self.sample for line in newest if all(line is not other for other in fresh))
+        return {f"{line[0]}{KILL_ID_SEPARATOR}{self.sample}.{index}" for index, line in enumerate(newest)}
 
 
 def ocr_events(path, region, reason, identify, duration, progress, *,
@@ -1140,7 +1219,7 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                             # OCR sometimes repeats a name within one line; count each line once.
                             if not any(seen is row for seen in counted):
                                 counted.append(row)
-                                killer_rows.append((row.text.casefold(), word.middle))
+                                killer_rows.append((row.text.casefold(), word.middle, feed_victim(row, word)))
                             if side == "left":
                                 killers.append((row, word))
             else:
