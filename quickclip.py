@@ -321,7 +321,20 @@ FEED = (.42, .30, .58, .0)
 SCORE = (.44, .38, .28, .34)
 KILL_BADGE_REGION = (.48, .20, .16, .60)
 KILL_AWARD_REGION = (.34, .15, .19, .53)
-KILL_BADGE_PATTERN = re.compile(r"\bKILL\b(?!\s+ASSIST\b)", re.IGNORECASE)
+KILL_BADGE_PATTERN = re.compile(r"\bKILL\b(?!\s+ASSIST\b)|\bHEAD\s?SHOT\b", re.IGNORECASE)
+# Score badges that are not kills. Some carry a skull or a similar icon beside their score,
+# so without a readable KILL badge they would pass for one.
+NON_KILL_BADGE = re.compile(
+    r"\b(?:ASSIST|CAPTURED?|ORDER\s+COMPLETED|REVIVED?|RESUPPLY|REPAIR(?:ED)?|HEAL(?:ED)?|SPOT(?:TED)?"
+    r"|M\s*-?\s*COM|ARMED|DISARMED|GAUNTLET|MAN\s+DOWN|TERRITORY"
+    r"|(?<!VEHICLE )(?<!HELICOPTER )DESTROYED)\b", re.IGNORECASE)
+# "KILL x3", "DOUBLE KILL" and the like: how many kills the badge counts at once.
+BADGE_KILL_COUNT = re.compile(r"\bKILL\s*[x×]\s*([2-9])\b|\b(DOUBLE|TRIPLE|QUAD)\s+KILL\b", re.IGNORECASE)
+BADGE_KILL_WORDS = {"double": 2, "triple": 3, "quad": 4}
+# Awards read from badges, usable in --only-weapon without a saved icon.
+BADGE_AWARDS = frozenset({"headshot", "ballistic", "flying ace"})
+# Seconds after a KILL badge to keep reading badges that arrive one after another.
+BADGE_FOLLOW_UP = (.5, 1, 1.5)
 DEFAULT_SCORE = r"\+\s*[0-9]{2,5}\b|\b[0-9]{2,5}\s*XP\b"
 NAME_TOKEN = re.compile(r"(?=[\w.-]*[^\W\d_])[\w.-]{3,32}")
 OCR_LOOKALIKES = ("o0", "il1", "s5", "b8", "z2")
@@ -962,6 +975,8 @@ def kill_awards(rows):
     for row in rows:
         text = row.text.upper()
         awards.update(re.findall(r"\b(?:BALLISTIC|FLYING ACE)\b", text))
+        if re.search(r"\bHEAD\s?SHOT\b", text):
+            awards.add("HEADSHOT")
         for index, word in enumerate(row.words[:-1]):
             pair = row.words[index:index + 2]
             if " ".join(part.text.upper() for part in pair) != "NEW BEST":
@@ -985,10 +1000,27 @@ def kill_awards(rows):
     return awards
 
 
+def badge_kill_count(rows):
+    count = 1
+    for row in rows:
+        for match in BADGE_KILL_COUNT.finditer(row.text):
+            count = max(count, int(match.group(1)) if match.group(1) else BADGE_KILL_WORDS[match.group(2).casefold()])
+    return count
+
+
+def badge_target(rows):
+    positioned = position_feed_rows(rows, None)
+    if any(re.search(r"\bHELICOPTER\s+(?:DESTROYED|KILL)\b", row.text, re.IGNORECASE) for row in positioned):
+        return "Target: Helicopter"
+    if any(re.search(r"\bVEHICLE\s+DESTROYED\b", row.text, re.IGNORECASE) for row in positioned):
+        return "Target: Vehicle"
+    return None
+
+
 def kill_badge_match(frame, rows, reference=None):
     if any(KILL_BADGE_PATTERN.search(row.text) for row in rows):
         return "boxed KILL text"
-    if any(re.search(r"\bKILL\s+ASSIST\b", row.text, re.IGNORECASE) for row in rows):
+    if any(NON_KILL_BADGE.search(row.text) for row in rows):
         return None
     for word in badge_scores(rows):
         if reference is not None and matches_skull_reference(frame, word, reference):
@@ -1291,14 +1323,25 @@ def scan(path, recording, track, threshold, player, score, before, after, progre
                         break
             for award in sorted(awards):
                 yield f"Award: {award}"
-            positioned = position_feed_rows(rows, None)
+            target = badge_target(rows)
+            kills = badge_kill_count(rows)
+            # The game adds badges one after another, so VEHICLE DESTROYED or KILL x2 can
+            # appear a moment after the first KILL badge.
+            for delay in BADGE_FOLLOW_UP:
+                if target or timestamp + delay >= recording.duration or (stop is not None and stop.is_set()):
+                    break
+                try:
+                    _, later, _ = preview_kill_badge(path, timestamp + delay)
+                except (OSError, RuntimeError, ValueError):
+                    break
+                target = badge_target(later)
+                kills = max(kills, badge_kill_count(later))
             if "BALLISTIC" in awards:
                 yield "Target: Helicopter (BALLISTIC)"
-            elif any(re.search(r"\bHELICOPTER\s+(?:DESTROYED|KILL)\b", row.text, re.IGNORECASE)
-                   for row in positioned):
-                yield "Target: Helicopter"
-            elif any(re.search(r"\bVEHICLE\s+DESTROYED\b", row.text, re.IGNORECASE) for row in positioned):
-                yield "Target: Vehicle"
+            elif target:
+                yield target
+            if kills > 1:
+                yield f"{KILL_COUNT_PREFIX}{kills}"
             if feed.badge_feed_details:
                 progress(f"Checking kill feed near {timestamp:.2f}s…")
                 try:
@@ -2251,7 +2294,9 @@ def parse_weapon_filter(text):
 
 
 def clip_weapons(clip):
-    return {reason.removeprefix("Weapon: ").casefold() for reason in clip.reasons if reason.startswith("Weapon: ")}
+    """Weapon labels and awards such as HEADSHOT, so either can pick clips for a montage."""
+    return {reason.split(": ", 1)[1].casefold() for reason in clip.reasons
+            if reason.startswith(("Weapon: ", "Award: "))}
 
 
 def matches_weapons(clip, wanted):
@@ -2401,7 +2446,8 @@ def main():
             if args.only_weapon:
                 labels = {reference.label.casefold() for reference in feed.weapon_references
                           if reference.mode == feed.mode}
-                missing = parse_weapon_filter(",".join(args.only_weapon)) - labels
+                # Awards come from the KILL badge, not from a saved icon.
+                missing = parse_weapon_filter(",".join(args.only_weapon)) - labels - BADGE_AWARDS
                 if missing:
                     raise ValueError(f"No saved {feed.mode} weapon icon is labelled {', '.join(sorted(missing))}. "
                                      "Save one in Test feed OCR, or pass --settings.")
